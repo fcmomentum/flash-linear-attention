@@ -223,6 +223,7 @@ class GatedDeltaNet(nn.Module):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         output_attentions: bool | None = False,
+        value_residual: torch.Tensor | None = None,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         if attention_mask is not None:
@@ -273,6 +274,10 @@ class GatedDeltaNet(nn.Module):
             q = F.silu(self.q_proj(hidden_states))
             k = F.silu(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
+
+        # Add value residual if provided (e.g. from ResFormer-style value embedding)
+        if value_residual is not None:
+            v = v + value_residual
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         # Apply learned feature map: φ(x) = W_φ[x; act(x)]
