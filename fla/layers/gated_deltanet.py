@@ -100,6 +100,7 @@ class GatedDeltaNet(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        phi_ratio: float = 2,
         **kwargs,
     ) -> GatedDeltaNet:
         super().__init__()
@@ -147,6 +148,11 @@ class GatedDeltaNet(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.a_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
+
+        # Learned feature map: φ(x) = W_φ[x; ReLU(x)], shared across heads
+        self.phi_ratio = phi_ratio
+        self.head_phi_dim = int(self.head_k_dim * phi_ratio)
+        self.phi_proj = nn.Linear(2 * self.head_k_dim, self.head_phi_dim, bias=False)
 
         A = torch.empty(self.num_v_heads, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -258,6 +264,9 @@ class GatedDeltaNet(nn.Module):
             v = F.silu(self.v_proj(hidden_states))
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
+        # Apply learned feature map: φ(x) = W_φ[x; ReLU(x)]
+        q = self.phi_proj(torch.cat([q, F.relu(q)], dim=-1))
+        k = self.phi_proj(torch.cat([k, F.relu(k)], dim=-1))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
         if self.num_v_heads > self.num_heads:
