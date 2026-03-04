@@ -100,6 +100,7 @@ class GatedDeltaNet(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        use_phi_proj: bool = False,
         phi_ratio: float = 2,
         phi_act: str = 'relu',
         **kwargs,
@@ -151,19 +152,21 @@ class GatedDeltaNet(nn.Module):
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
 
         # Learned feature map: φ(x) = W_φ[x; act(x)], shared across heads
-        self.phi_ratio = phi_ratio
-        self.head_phi_dim = int(self.head_k_dim * phi_ratio)
-        self.phi_proj = nn.Linear(2 * self.head_k_dim, self.head_phi_dim, bias=False)
-        _act_map = {
-            'identity': nn.Identity(),
-            'relu': nn.ReLU(),
-            'gelu': nn.GELU(),
-            'silu': nn.SiLU(),
-            'sigmoid': nn.Sigmoid(),
-            'tanh': nn.Tanh(),
-        }
-        assert phi_act in _act_map, f"Unknown phi_act='{phi_act}'. Choose from: {list(_act_map.keys())}"
-        self.phi_act = _act_map[phi_act]
+        self.use_phi_proj = use_phi_proj
+        if use_phi_proj:
+            self.phi_ratio = phi_ratio
+            self.head_phi_dim = int(self.head_k_dim * phi_ratio)
+            self.phi_proj = nn.Linear(2 * self.head_k_dim, self.head_phi_dim, bias=False)
+            _act_map = {
+                'identity': nn.Identity(),
+                'relu': nn.ReLU(),
+                'gelu': nn.GELU(),
+                'silu': nn.SiLU(),
+                'sigmoid': nn.Sigmoid(),
+                'tanh': nn.Tanh(),
+            }
+            assert phi_act in _act_map, f"Unknown phi_act='{phi_act}'. Choose from: {list(_act_map.keys())}"
+            self.phi_act = _act_map[phi_act]
 
         A = torch.empty(self.num_v_heads, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -280,9 +283,13 @@ class GatedDeltaNet(nn.Module):
             v = v + value_residual
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
-        # Apply learned feature map: φ(x) = W_φ[x; act(x)]
-        q = self.phi_proj(torch.cat([q, self.phi_act(q)], dim=-1))
-        k = self.phi_proj(torch.cat([k, self.phi_act(k)], dim=-1))
+        if self.use_phi_proj:
+            # Apply learned feature map: φ(x) = W_φ[x; act(x)]
+            q = self.phi_proj(torch.cat([q, self.phi_act(q)], dim=-1))
+            k = self.phi_proj(torch.cat([k, self.phi_act(k)], dim=-1))
+        else:
+            q = elu_p1(q)
+            k = elu_p1(k)
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
         if self.num_v_heads > self.num_heads:
