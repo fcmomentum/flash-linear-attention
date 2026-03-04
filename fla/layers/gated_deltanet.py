@@ -21,6 +21,15 @@ if TYPE_CHECKING:
     from fla.models.utils import Cache
 
 
+def apply_rotary_emb(x, cos, sin):
+    """Apply rotary position embeddings. x: (..., H, D), cos/sin: (1, T, 1, D//2)."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], -1)
+
+
 @torch.compile
 def elu_p1(x):
     return (F.elu(x, 1., False) + 1.).to(x)
@@ -101,6 +110,7 @@ class GatedDeltaNet(nn.Module):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         use_phi_proj: bool = False,
+        use_rope: bool = False,
         phi_ratio: float = 2,
         phi_act: str = 'relu',
         **kwargs,
@@ -151,7 +161,8 @@ class GatedDeltaNet(nn.Module):
         self.a_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
 
-        # Learned feature map: φ(x) = W_φ[x; act(x)], shared across heads
+        # Feature map selection: RoPE, learned phi projection, or elu+1 (default)
+        self.use_rope = use_rope
         self.use_phi_proj = use_phi_proj
         if use_phi_proj:
             self.phi_ratio = phi_ratio
@@ -283,7 +294,14 @@ class GatedDeltaNet(nn.Module):
             v = v + value_residual
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
-        if self.use_phi_proj:
+        if self.use_rope:
+            # Apply rotary position embeddings for RoPE DeltaNet
+            cos_sin = kwargs.get('cos_sin')
+            assert cos_sin is not None, "cos_sin must be provided when use_rope=True"
+            cos, sin = cos_sin
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+        elif self.use_phi_proj:
             # Apply learned feature map: φ(x) = W_φ[x; act(x)]
             q = self.phi_proj(torch.cat([q, self.phi_act(q)], dim=-1))
             k = self.phi_proj(torch.cat([k, self.phi_act(k)], dim=-1))
