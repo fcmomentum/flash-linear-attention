@@ -111,6 +111,7 @@ class GatedDeltaNet(nn.Module):
         norm_eps: float = 1e-5,
         use_phi_proj: bool = False,
         use_rope: bool = False,
+        rope_dyadic: bool = True,
         phi_ratio: float = 2,
         phi_act: str = 'relu',
         **kwargs,
@@ -163,6 +164,7 @@ class GatedDeltaNet(nn.Module):
 
         # Feature map selection: RoPE, learned phi projection, or elu+1 (default)
         self.use_rope = use_rope
+        self.rope_dyadic = rope_dyadic if use_rope else False
         self.use_phi_proj = use_phi_proj
         if use_phi_proj:
             self.phi_ratio = phi_ratio
@@ -296,9 +298,18 @@ class GatedDeltaNet(nn.Module):
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         if self.use_rope:
             # Apply rotary position embeddings for RoPE DeltaNet
-            cos_sin = kwargs.get('cos_sin')
-            assert cos_sin is not None, "cos_sin must be provided when use_rope=True"
-            cos, sin = cos_sin
+            if self.rope_dyadic:
+                # Dyadic (power-of-2) frequency spacing: inv_freq[i] = 2^(-i)
+                d = self.head_k_dim // 2
+                inv_freq = 2.0 ** (-torch.arange(d, dtype=torch.float32, device=q.device))
+                t = torch.arange(q_len, dtype=torch.float32, device=q.device)
+                freqs = torch.outer(t, inv_freq)
+                cos = freqs.cos().to(q.dtype)[None, :, None, :]
+                sin = freqs.sin().to(q.dtype)[None, :, None, :]
+            else:
+                cos_sin = kwargs.get('cos_sin')
+                assert cos_sin is not None, "cos_sin must be provided when use_rope=True and rope_dyadic=False"
+                cos, sin = cos_sin
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
         elif self.use_phi_proj:
