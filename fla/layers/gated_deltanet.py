@@ -35,6 +35,39 @@ def elu_p1(x):
     return (F.elu(x, 1., False) + 1.).to(x)
 
 
+def oscillatory_key_scan(k, omega):
+    """
+    Oscillatory key dynamics: k̃_t = R(ω) k̃_{t-1} + k_t
+
+    Pairs of key dimensions (2i, 2i+1) are treated as complex numbers.
+    R(ω) becomes multiplication by e^{jω}.
+
+    Args:
+        k: key tensor of shape (B, T, H, D) — D must be even
+        omega: learnable frequencies of shape (H, D//2)
+
+    Returns:
+        k_tilde: rotated key tensor, same shape as k
+    """
+    B, T, H, D = k.shape
+    # Convert dim pairs to complex: z_t = k_{2i} + j*k_{2i+1}
+    k_pairs = k.float().reshape(B, T, H, D // 2, 2)
+    z = torch.complex(k_pairs[..., 0], k_pairs[..., 1])  # (B, T, H, D//2)
+
+    # Rotation coefficient: a = e^{jω}, |a|=1
+    a = torch.polar(torch.ones_like(omega), omega)  # (H, D//2)
+
+    # Sequential scan: z̃_t = a * z̃_{t-1} + z_t
+    z_tilde = torch.empty_like(z)
+    z_tilde[:, 0] = z[:, 0]
+    for t in range(1, T):
+        z_tilde[:, t] = a * z_tilde[:, t - 1] + z[:, t]
+
+    # Convert back to real pairs
+    out = torch.stack([z_tilde.real, z_tilde.imag], dim=-1)  # (B, T, H, D//2, 2)
+    return out.reshape(B, T, H, D).to(k.dtype)
+
+
 @torch.compile
 def sum_norm(x):
     return (x / x.sum(-1, keepdim=True)).to(x)
@@ -111,7 +144,8 @@ class GatedDeltaNet(nn.Module):
         norm_eps: float = 1e-5,
         use_phi_proj: bool = False,
         use_rope: bool = False,
-        rope_dyadic: bool = True,
+        rope_dyadic: bool = False,
+        use_oscillatory_keys: bool = False,
         phi_ratio: float = 2,
         phi_act: str = 'relu',
         **kwargs,
@@ -165,7 +199,17 @@ class GatedDeltaNet(nn.Module):
         # Feature map selection: RoPE, learned phi projection, or elu+1 (default)
         self.use_rope = use_rope
         self.rope_dyadic = rope_dyadic if use_rope else False
+        self.use_oscillatory_keys = use_oscillatory_keys
         self.use_phi_proj = use_phi_proj
+        if use_oscillatory_keys:
+            # Learnable frequencies per head, log-uniform init like RoPE θ
+            # omega[h, i] ∈ [1/D, 1] initially, giving multi-scale phase evolution
+            d_pairs = self.head_k_dim // 2
+            omega_init = torch.exp(
+                torch.linspace(math.log(1.0 / d_pairs), 0, d_pairs)
+            ).unsqueeze(0).expand(self.num_heads, -1).clone()
+            self.oscillatory_omega = nn.Parameter(omega_init)
+            self.oscillatory_omega._no_weight_decay = True
         if use_phi_proj:
             self.phi_ratio = phi_ratio
             self.head_phi_dim = int(self.head_k_dim * phi_ratio)
@@ -320,6 +364,10 @@ class GatedDeltaNet(nn.Module):
             q = elu_p1(q)
             k = elu_p1(k)
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+
+        # Oscillatory key dynamics: k̃_t = R(ω) k̃_{t-1} + k_t
+        if self.use_oscillatory_keys:
+            k = oscillatory_key_scan(k, self.oscillatory_omega)
 
         if self.num_v_heads > self.num_heads:
             q, k = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads), (q, k))
