@@ -201,6 +201,22 @@ class GatedDeltaNet(nn.Module):
         self.rope_dyadic = rope_dyadic if use_rope else False
         self.use_oscillatory_keys = use_oscillatory_keys
         self.use_phi_proj = use_phi_proj
+        self.rope_omega = None
+        if self.use_rope:
+            d_pairs = self.head_k_dim // 2
+            if self.rope_dyadic:
+                omega = 2.0 ** (-torch.arange(d_pairs, dtype=torch.float32))
+                self.register_buffer(
+                    "rope_omega",
+                    omega.unsqueeze(0).expand(self.num_heads, -1).contiguous(),
+                    persistent=False,
+                )
+            else:
+                pair_idx = torch.arange(0, self.head_k_dim, 2, dtype=torch.float32)
+                inv_freq = 1.0 / (10000 ** (pair_idx / self.head_k_dim))
+                omega = inv_freq.unsqueeze(0).expand(self.num_heads, -1).contiguous().clone()
+                self.rope_omega = nn.Parameter(omega)
+                self.rope_omega._no_weight_decay = True
         if use_oscillatory_keys:
             # Learnable frequencies per head, log-uniform init like RoPE θ
             # omega[h, i] ∈ [1/D, 1] initially, giving multi-scale phase evolution
@@ -276,6 +292,14 @@ class GatedDeltaNet(nn.Module):
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
+    @staticmethod
+    def _positions_from_cu(cu_seqlens: torch.Tensor, device, dtype):
+        lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        if not lens:
+            return torch.zeros(0, device=device, dtype=dtype)
+        pos = [torch.arange(l, device=device, dtype=dtype) for l in lens]
+        return torch.cat(pos, dim=0)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,19 +365,16 @@ class GatedDeltaNet(nn.Module):
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         if self.use_rope:
-            # Apply rotary position embeddings for RoPE DeltaNet
-            if self.rope_dyadic:
-                # Dyadic (power-of-2) frequency spacing: inv_freq[i] = 2^(-i)
-                d = self.head_k_dim // 2
-                inv_freq = 2.0 ** (-torch.arange(d, dtype=torch.float32, device=q.device))
-                t = torch.arange(q_len, dtype=torch.float32, device=q.device)
-                freqs = torch.outer(t, inv_freq)
-                cos = freqs.cos().to(q.dtype)[None, :, None, :]
-                sin = freqs.sin().to(q.dtype)[None, :, None, :]
+            # State-space phase transition e^{iω} on S_{t-1} can be realized equivalently
+            # by rotating q/k with cumulative phase θ_t = t*ω before the delta-rule kernel.
+            omega = self.rope_omega.to(device=q.device, dtype=q.dtype)  # (H, D/2)
+            if attention_mask is not None and cu_seqlens is not None:
+                t = self._positions_from_cu(cu_seqlens, device=q.device, dtype=q.dtype)
             else:
-                cos_sin = kwargs.get('cos_sin')
-                assert cos_sin is not None, "cos_sin must be provided when use_rope=True and rope_dyadic=False"
-                cos, sin = cos_sin
+                t = torch.arange(q.shape[1], dtype=q.dtype, device=q.device)
+            angles = t[:, None, None] * omega[None, :, :]  # (T, H, D/2)
+            cos = torch.cos(angles).to(q.dtype)[None, :, :, :]
+            sin = torch.sin(angles).to(q.dtype)[None, :, :, :]
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
         elif self.use_phi_proj:
