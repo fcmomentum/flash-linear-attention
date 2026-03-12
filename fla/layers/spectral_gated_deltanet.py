@@ -115,7 +115,6 @@ class SpectralGatedDeltaNet(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         del output_attentions, kwargs
         input_dtype = hidden_states.dtype
-        proj_dtype = self.q_proj.weight.dtype
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] for padding."
@@ -127,9 +126,6 @@ class SpectralGatedDeltaNet(nn.Module):
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
-        if hidden_states.dtype != proj_dtype:
-            hidden_states = hidden_states.to(proj_dtype)
-
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
@@ -151,6 +147,7 @@ class SpectralGatedDeltaNet(nn.Module):
         B, T, H, Dk = k.shape
         Dv = v.shape[-1]
         dtype = hidden_states.dtype
+        kernel_dtype = v.dtype
 
         beta = torch.sigmoid(self.beta_proj(hidden_states).view(B, T, H, self.num_modes))  # (B,T,H,R)
         trans_gate = torch.sigmoid(self.trans_gate_proj(hidden_states).view(B, T, H, self.num_modes))  # (B,T,H,R)
@@ -168,50 +165,39 @@ class SpectralGatedDeltaNet(nn.Module):
         cos = torch.cos(angles).to(dtype=q.dtype).unsqueeze(0)  # (1,T,H,R,Dk/2)
         sin = torch.sin(angles).to(dtype=q.dtype).unsqueeze(0)
 
-        q = q.unsqueeze(3).expand(B, T, H, self.num_modes, Dk).reshape(B, T, H * self.num_modes, Dk)
-        k = k.unsqueeze(3).expand(B, T, H, self.num_modes, Dk).reshape(B, T, H * self.num_modes, Dk)
-        v = v.unsqueeze(3).expand(B, T, H, self.num_modes, Dv).reshape(B, T, H * self.num_modes, Dv)
-        cos_flat = cos.reshape(1, T, H * self.num_modes, Dk // 2)
-        sin_flat = sin.reshape(1, T, H * self.num_modes, Dk // 2)
-        q = self._apply_rotary_emb(q, cos_flat, sin_flat)
-        k = self._apply_rotary_emb(k, cos_flat, sin_flat)
-
-        rho = torch.exp(-F.softplus(self.log_decay)).to(device=hidden_states.device, dtype=dtype)  # (H,R)
-        decay = (trans_gate * rho.unsqueeze(0).unsqueeze(0)).clamp_min(1e-6)  # (B,T,H,R)
-        g = decay.log().reshape(B, T, H * self.num_modes)
-        beta = beta.reshape(B, T, H * self.num_modes)
-        # Triton gated-delta WY kernels are sensitive to mixed operand dtypes.
-        # Keep all kernel operands in fp32 to avoid A(fp32) vs v/beta(bf16) mismatches.
-        kernel_dtype = torch.float32
-        q = q.to(kernel_dtype)
-        k = k.to(kernel_dtype)
-        v = v.to(kernel_dtype)
-        beta = beta.to(kernel_dtype)
-        g = g.to(kernel_dtype)
-
+        # Keep shared k/v tensors (no H*R expansion); run one kernel per mode and mix outputs.
         mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
         if self.training:
             mode = "chunk"
-        if mode == "chunk":
-            o, _ = chunk_gated_delta_rule(
-                q=q, k=k, v=v, g=g, beta=beta,
-                initial_state=None, output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=self.use_qk_l2norm_in_kernel,
-            )
-        elif mode == "fused_recurrent":
-            o, _ = fused_recurrent_gated_delta_rule(
-                q=q, k=k, v=v, g=g, beta=beta,
-                initial_state=None, output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=self.use_qk_l2norm_in_kernel,
-            )
-        else:
-            raise NotImplementedError(f"Not supported mode `{mode}`.")
-
         mode_w = F.softmax(self.mode_logits.to(device=hidden_states.device, dtype=dtype), dim=-1)  # (H,R)
-        o = o.view(B, T, H, self.num_modes, Dv)
-        o = torch.einsum("bthrv,hr->bthv", o, mode_w)  # (B,T,H,Dv)
+        rho = torch.exp(-F.softplus(self.log_decay)).to(device=hidden_states.device, dtype=dtype)  # (H,R)
+        o = torch.zeros(B, T, H, Dv, device=hidden_states.device, dtype=kernel_dtype)
+        for r in range(self.num_modes):
+            cos_r = cos[:, :, :, r, :]  # (1,T,H,Dk/2)
+            sin_r = sin[:, :, :, r, :]
+            q_r = self._apply_rotary_emb(q, cos_r, sin_r).to(kernel_dtype)
+            k_r = self._apply_rotary_emb(k, cos_r, sin_r).to(kernel_dtype)
+            v_r = v if v.dtype == kernel_dtype else v.to(kernel_dtype)
+            decay_r = (trans_gate[..., r] * rho[:, r].unsqueeze(0).unsqueeze(0)).clamp_min(1e-6)  # (B,T,H)
+            g_r = decay_r.log()
+            beta_r = beta[..., r].to(kernel_dtype)
+            if mode == "chunk":
+                o_r, _ = chunk_gated_delta_rule(
+                    q=q_r, k=k_r, v=v_r, g=g_r, beta=beta_r,
+                    initial_state=None, output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=self.use_qk_l2norm_in_kernel,
+                )
+            elif mode == "fused_recurrent":
+                o_r, _ = fused_recurrent_gated_delta_rule(
+                    q=q_r, k=k_r, v=v_r, g=g_r, beta=beta_r,
+                    initial_state=None, output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=self.use_qk_l2norm_in_kernel,
+                )
+            else:
+                raise NotImplementedError(f"Not supported mode `{mode}`.")
+            o = o + o_r * mode_w[:, r].to(o_r.dtype).view(1, 1, H, 1)
         if self.g_proj is not None:
             gate = torch.sigmoid(rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", h=H, d=Dv))
             self._last_output_gate_mean = gate.detach().mean()
