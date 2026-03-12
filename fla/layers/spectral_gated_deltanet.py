@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -37,7 +38,9 @@ class SpectralGatedDeltaNet(nn.Module):
         num_heads: int = 8,
         num_v_heads: int | None = None,
         num_modes: int = 32,
+        mode: str = "chunk",
         use_gate: bool = True,
+        use_qk_l2norm_in_kernel: bool = True,
         layer_idx: int | None = None,
         **kwargs,
     ) -> SpectralGatedDeltaNet:
@@ -50,6 +53,8 @@ class SpectralGatedDeltaNet(nn.Module):
         self.num_modes = int(max(1, num_modes))
         self.layer_idx = layer_idx
         self.use_gate = use_gate
+        self.mode = mode
+        self.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
 
         self.head_k_dim = self.head_dim
         self.head_v_dim = int(self.head_dim * expand_v)
@@ -82,6 +87,22 @@ class SpectralGatedDeltaNet(nn.Module):
         self._last_trans_gate_mean = None
         self._last_output_gate_mean = None
 
+    @staticmethod
+    def _apply_rotary_emb(x, cos, sin):
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat([y1, y2], -1)
+
+    @staticmethod
+    def _positions_from_cu(cu_seqlens: torch.Tensor, device, dtype):
+        lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        if not lens:
+            return torch.zeros(0, device=device, dtype=dtype)
+        pos = [torch.arange(l, device=device, dtype=dtype) for l in lens]
+        return torch.cat(pos, dim=0)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -102,8 +123,9 @@ class SpectralGatedDeltaNet(nn.Module):
 
         batch_size, q_len, _ = hidden_states.shape
         indices = None
+        cu_seqlens = None
         if attention_mask is not None:
-            indices, _, _ = get_unpad_data(attention_mask[:, -q_len:])
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
         if hidden_states.dtype != proj_dtype:
             hidden_states = hidden_states.to(proj_dtype)
@@ -130,46 +152,58 @@ class SpectralGatedDeltaNet(nn.Module):
         Dv = v.shape[-1]
         dtype = hidden_states.dtype
 
-        beta = torch.sigmoid(self.beta_proj(hidden_states).view(B, T, H, self.num_modes))
-        trans_gate = torch.sigmoid(self.trans_gate_proj(hidden_states).view(B, T, H, self.num_modes))
+        beta = torch.sigmoid(self.beta_proj(hidden_states).view(B, T, H, self.num_modes))  # (B,T,H,R)
+        trans_gate = torch.sigmoid(self.trans_gate_proj(hidden_states).view(B, T, H, self.num_modes))  # (B,T,H,R)
         self._last_beta_mean = beta.detach().mean()
         self._last_trans_gate_mean = trans_gate.detach().mean()
 
-        omega_scale = torch.exp(self.omega_log_scale).to(device=hidden_states.device, dtype=dtype)  # (H, R)
-        omega_pairs = omega_scale.unsqueeze(-1) * self.omega_inv_freq.to(device=hidden_states.device, dtype=dtype).unsqueeze(0).unsqueeze(0)  # (H, R, Dk/2)
-        omega_full = torch.repeat_interleave(omega_pairs, 2, dim=-1)  # (H, R, Dk), pairwise frequency sharing
-        cos_w = torch.cos(omega_full)
-        sin_w = torch.sin(omega_full)
-        rho = torch.exp(-F.softplus(self.log_decay)).to(device=hidden_states.device, dtype=dtype)
-        mode_w = F.softmax(self.mode_logits.to(device=hidden_states.device, dtype=dtype), dim=-1)
+        # RoPE-style spectral rotation applied to q/k, then integrate state with fused kernels.
+        omega_scale = torch.exp(self.omega_log_scale).to(device=hidden_states.device, dtype=dtype)  # (H,R)
+        inv_freq = self.omega_inv_freq.to(device=hidden_states.device, dtype=dtype)  # (Dk/2,)
+        if attention_mask is not None and cu_seqlens is not None:
+            pos = self._positions_from_cu(cu_seqlens, device=hidden_states.device, dtype=dtype)  # (T,)
+        else:
+            pos = torch.arange(T, device=hidden_states.device, dtype=dtype)
+        angles = pos[:, None, None, None] * omega_scale[None, :, :, None] * inv_freq[None, None, None, :]  # (T,H,R,Dk/2)
+        cos = torch.cos(angles).unsqueeze(0)  # (1,T,H,R,Dk/2)
+        sin = torch.sin(angles).unsqueeze(0)
 
-        state_r = torch.zeros(B, H, self.num_modes, Dv, Dk, device=hidden_states.device, dtype=dtype)
-        state_i = torch.zeros_like(state_r)
-        y_steps = []
+        q = q.unsqueeze(3).expand(B, T, H, self.num_modes, Dk).reshape(B, T, H * self.num_modes, Dk)
+        k = k.unsqueeze(3).expand(B, T, H, self.num_modes, Dk).reshape(B, T, H * self.num_modes, Dk)
+        v = v.unsqueeze(3).expand(B, T, H, self.num_modes, Dv).reshape(B, T, H * self.num_modes, Dv)
+        cos_flat = cos.reshape(1, T, H * self.num_modes, Dk // 2)
+        sin_flat = sin.reshape(1, T, H * self.num_modes, Dk // 2)
+        q = self._apply_rotary_emb(q, cos_flat, sin_flat)
+        k = self._apply_rotary_emb(k, cos_flat, sin_flat)
 
-        for t in range(T):
-            q_t = q[:, t]
-            k_t = k[:, t]
-            v_t = v[:, t]
+        rho = torch.exp(-F.softplus(self.log_decay)).to(device=hidden_states.device, dtype=dtype)  # (H,R)
+        decay = (trans_gate * rho.unsqueeze(0).unsqueeze(0)).clamp_min(1e-6)  # (B,T,H,R)
+        g = decay.log().reshape(B, T, H * self.num_modes)
+        beta = beta.reshape(B, T, H * self.num_modes)
 
-            decay = (trans_gate[:, t] * rho.unsqueeze(0)).unsqueeze(-1).unsqueeze(-1)
-            c = cos_w.unsqueeze(0).unsqueeze(-2)  # (1, H, R, 1, Dk)
-            s = sin_w.unsqueeze(0).unsqueeze(-2)
-            rot_r = decay * (c * state_r - s * state_i)
-            rot_i = decay * (s * state_r + c * state_i)
+        mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
+        if self.training:
+            mode = "chunk"
+        if mode == "chunk":
+            o, _ = chunk_gated_delta_rule(
+                q=q, k=k, v=v, g=g, beta=beta,
+                initial_state=None, output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm_in_kernel,
+            )
+        elif mode == "fused_recurrent":
+            o, _ = fused_recurrent_gated_delta_rule(
+                q=q, k=k, v=v, g=g, beta=beta,
+                initial_state=None, output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm_in_kernel,
+            )
+        else:
+            raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-            pred = torch.einsum("bhrvk,bhk->bhrv", rot_r, k_t)
-            err = v_t.unsqueeze(2) - pred
-            write = torch.einsum("bhrv,bhk->bhrvk", err, k_t)
-            b = beta[:, t].unsqueeze(-1).unsqueeze(-1)
-            state_r = rot_r + b * write
-            state_i = rot_i
-
-            read = torch.einsum("bhrvk,bhk->bhrv", state_r, q_t)
-            y_t = torch.einsum("bhrv,hr->bhv", read, mode_w)
-            y_steps.append(y_t)
-
-        o = torch.stack(y_steps, dim=1)  # (B, T, H, Dv)
+        mode_w = F.softmax(self.mode_logits.to(device=hidden_states.device, dtype=dtype), dim=-1)  # (H,R)
+        o = o.view(B, T, H, self.num_modes, Dv)
+        o = torch.einsum("bthrv,hr->bthv", o, mode_w)  # (B,T,H,Dv)
         if self.g_proj is not None:
             gate = torch.sigmoid(rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", h=H, d=Dv))
             self._last_output_gate_mean = gate.detach().mean()
