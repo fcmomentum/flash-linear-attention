@@ -165,8 +165,8 @@ class SpectralGatedDeltaNet(nn.Module):
         else:
             pos = torch.arange(T, device=hidden_states.device, dtype=dtype)
         angles = pos[:, None, None, None] * omega_scale[None, :, :, None] * inv_freq[None, None, None, :]  # (T,H,R,Dk/2)
-        cos = torch.cos(angles).unsqueeze(0)  # (1,T,H,R,Dk/2)
-        sin = torch.sin(angles).unsqueeze(0)
+        cos = torch.cos(angles).to(dtype=q.dtype).unsqueeze(0)  # (1,T,H,R,Dk/2)
+        sin = torch.sin(angles).to(dtype=q.dtype).unsqueeze(0)
 
         q = q.unsqueeze(3).expand(B, T, H, self.num_modes, Dk).reshape(B, T, H * self.num_modes, Dk)
         k = k.unsqueeze(3).expand(B, T, H, self.num_modes, Dk).reshape(B, T, H * self.num_modes, Dk)
@@ -180,6 +180,12 @@ class SpectralGatedDeltaNet(nn.Module):
         decay = (trans_gate * rho.unsqueeze(0).unsqueeze(0)).clamp_min(1e-6)  # (B,T,H,R)
         g = decay.log().reshape(B, T, H * self.num_modes)
         beta = beta.reshape(B, T, H * self.num_modes)
+        # Triton gated-delta kernels expect consistent dtypes across operands.
+        kernel_dtype = v.dtype
+        q = q.to(kernel_dtype)
+        k = k.to(kernel_dtype)
+        beta = beta.to(kernel_dtype)
+        g = g.to(kernel_dtype)
 
         mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
         if self.training:
