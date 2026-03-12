@@ -93,6 +93,8 @@ class SpectralGatedDeltaNet(nn.Module):
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         del output_attentions, kwargs
+        input_dtype = hidden_states.dtype
+        proj_dtype = self.q_proj.weight.dtype
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] for padding."
@@ -103,11 +105,15 @@ class SpectralGatedDeltaNet(nn.Module):
         if attention_mask is not None:
             indices, _, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+        if hidden_states.dtype != proj_dtype:
+            hidden_states = hidden_states.to(proj_dtype)
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         if value_residual is not None:
+            if value_residual.dtype != v.dtype:
+                value_residual = value_residual.to(v.dtype)
             v = v + value_residual
 
         q = rearrange(q, "... (h d) -> ... h d", h=self.num_heads, d=self.head_k_dim)
@@ -172,6 +178,8 @@ class SpectralGatedDeltaNet(nn.Module):
             self._last_output_gate_mean = None
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self.o_proj(o)
+        if o.dtype != input_dtype:
+            o = o.to(input_dtype)
 
         if attention_mask is not None:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
