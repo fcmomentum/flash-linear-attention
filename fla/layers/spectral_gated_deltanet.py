@@ -180,10 +180,12 @@ class SpectralGatedDeltaNet(nn.Module):
         decay = (trans_gate * rho.unsqueeze(0).unsqueeze(0)).clamp_min(1e-6)  # (B,T,H,R)
         g = decay.log().reshape(B, T, H * self.num_modes)
         beta = beta.reshape(B, T, H * self.num_modes)
-        # Triton gated-delta kernels expect consistent dtypes across operands.
-        kernel_dtype = v.dtype
+        # Triton gated-delta WY kernels are sensitive to mixed operand dtypes.
+        # Keep all kernel operands in fp32 to avoid A(fp32) vs v/beta(bf16) mismatches.
+        kernel_dtype = torch.float32
         q = q.to(kernel_dtype)
         k = k.to(kernel_dtype)
+        v = v.to(kernel_dtype)
         beta = beta.to(kernel_dtype)
         g = g.to(kernel_dtype)
 
