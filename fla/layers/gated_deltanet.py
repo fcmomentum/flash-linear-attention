@@ -145,6 +145,8 @@ class GatedDeltaNet(nn.Module):
         use_phi_proj: bool = False,
         use_rope: bool = False,
         rope_dyadic: bool = False,
+        token_phase_rope: bool = False,
+        token_phase_source: str = 'x',
         use_oscillatory_keys: bool = False,
         phi_ratio: float = 2,
         phi_act: str = 'relu',
@@ -199,9 +201,15 @@ class GatedDeltaNet(nn.Module):
         # Feature map selection: RoPE, learned phi projection, or elu+1 (default)
         self.use_rope = use_rope
         self.rope_dyadic = rope_dyadic if use_rope else False
+        self.token_phase_rope = bool(token_phase_rope)
+        self.token_phase_source = token_phase_source
+        if self.token_phase_source not in {'x', 'embed'}:
+            raise ValueError(f"token_phase_source must be one of ['x','embed'], got {self.token_phase_source}")
         self.use_oscillatory_keys = use_oscillatory_keys
         self.use_phi_proj = use_phi_proj
         self.rope_omega = None
+        self.phase_q_proj = None
+        self.phase_k_proj = None
         if self.use_rope:
             d_pairs = self.head_k_dim // 2
             if self.rope_dyadic:
@@ -217,6 +225,9 @@ class GatedDeltaNet(nn.Module):
                 omega = inv_freq.unsqueeze(0).expand(self.num_heads, -1).contiguous().clone()
                 self.rope_omega = nn.Parameter(omega)
                 self.rope_omega._no_weight_decay = True
+            if self.token_phase_rope:
+                self.phase_q_proj = nn.Linear(hidden_size, self.num_heads * d_pairs, bias=False)
+                self.phase_k_proj = nn.Linear(hidden_size, self.num_heads * d_pairs, bias=False)
         if use_oscillatory_keys:
             # Learnable frequencies per head, log-uniform init like RoPE θ
             # omega[h, i] ∈ [1/D, 1] initially, giving multi-scale phase evolution
@@ -328,9 +339,12 @@ class GatedDeltaNet(nn.Module):
             last_state = past_key_values[self.layer_idx]
 
         cu_seqlens = kwargs.get('cu_seqlens')
+        token_embed = kwargs.get('token_embed', None)
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+            if token_embed is not None:
+                token_embed = index_first_axis(rearrange(token_embed, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
@@ -377,6 +391,15 @@ class GatedDeltaNet(nn.Module):
             sin = torch.sin(angles).to(q.dtype)[None, :, :, :]
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
+            if self.token_phase_rope and self.phase_q_proj is not None and self.phase_k_proj is not None:
+                phase_src = hidden_states if self.token_phase_source == 'x' else token_embed
+                if phase_src is None:
+                    raise ValueError("token_embed is required when token_phase_source='embed'")
+                d_pairs = self.head_k_dim // 2
+                psi_q = math.pi * torch.tanh(self.phase_q_proj(phase_src)).view(*q.shape[:-1], d_pairs)
+                psi_k = math.pi * torch.tanh(self.phase_k_proj(phase_src)).view(*k.shape[:-1], d_pairs)
+                q = apply_rotary_emb(q, torch.cos(psi_q), torch.sin(psi_q))
+                k = apply_rotary_emb(k, torch.cos(psi_k), torch.sin(psi_k))
         elif self.use_phi_proj:
             # Apply learned feature map: φ(x) = W_φ[x; act(x)]
             q = self.phi_proj(torch.cat([q, self.phi_act(q)], dim=-1))
