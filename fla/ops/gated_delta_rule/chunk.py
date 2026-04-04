@@ -849,7 +849,7 @@ def _build_rank1_dc_chunk_transfer(
     r_chunk = torch.empty(c, d, device=device, dtype=dtype)
     for t in range(c):
         proj = torch.matmul(c_vecs[t], a_chunk)
-        a_chunk = alpha[t] * a_chunk - beta_chunk[t] * torch.outer(u_vecs[t], proj)
+        a_chunk = alpha[t] * (a_chunk - beta_chunk[t] * torch.outer(u_vecs[t], proj))
         r_chunk[t] = torch.matmul(rs[t], a_chunk)
 
     use_triton_cols = False
@@ -864,7 +864,7 @@ def _build_rank1_dc_chunk_transfer(
                 )
             else:
                 proj = torch.matmul(c_vecs[t], z_cols[:, :t])
-                z_cols[:, :t] = alpha[t] * z_cols[:, :t] - beta_chunk[t] * u_vecs[t][:, None] * proj[None, :]
+                z_cols[:, :t] = alpha[t] * (z_cols[:, :t] - beta_chunk[t] * u_vecs[t][:, None] * proj[None, :])
                 l_chunk[t, :t] = torch.matmul(rs[t], z_cols[:, :t])
         z_cols[:, t] = p_vecs[t]
         l_chunk[t, t] = torch.dot(rs[t], p_vecs[t])
@@ -875,7 +875,7 @@ def _build_rank1_dc_chunk_transfer(
             _rank1_dc_update_cols_fused_triton(p_cols[:, :t], c_vecs[t], u_vecs[t], alpha[t], beta_chunk[t])
         else:
             proj = torch.matmul(c_vecs[t], p_cols[:, :t])
-            p_cols[:, :t] = alpha[t] * p_cols[:, :t] - beta_chunk[t] * u_vecs[t][:, None] * proj[None, :]
+            p_cols[:, :t] = alpha[t] * (p_cols[:, :t] - beta_chunk[t] * u_vecs[t][:, None] * proj[None, :])
     p_chunk = p_cols.transpose(0, 1).contiguous()
 
     return a_chunk, r_chunk, l_chunk, p_chunk
