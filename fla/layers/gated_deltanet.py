@@ -16,6 +16,7 @@ from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_rank1_dc,
     naive_recurrent_gated_delta_rule_rank1_dc,
 )
 
@@ -288,19 +289,35 @@ class GatedDeltaNet(nn.Module):
             lambda_k = (k * nu.unsqueeze(0).unsqueeze(0)).sum(-1) / nu_sq.unsqueeze(0).unsqueeze(0)
             q_scaled = q * (self.head_k_dim ** -0.5)
             lambda_q = (q_scaled * nu.unsqueeze(0).unsqueeze(0)).sum(-1) / nu_sq.unsqueeze(0).unsqueeze(0)
-            o, recurrent_state = naive_recurrent_gated_delta_rule_rank1_dc(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                lambda_q=lambda_q,
-                lambda_k=lambda_k,
-                scale=self.head_k_dim ** -0.5,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
+            if mode == 'fused_recurrent':
+                o, recurrent_state = fused_recurrent_gated_delta_rule_rank1_dc(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    lambda_q=lambda_q,
+                    lambda_k=lambda_k,
+                    scale=self.head_k_dim ** -0.5,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=False,
+                )
+            else:
+                o, recurrent_state = naive_recurrent_gated_delta_rule_rank1_dc(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    lambda_q=lambda_q,
+                    lambda_k=lambda_k,
+                    scale=self.head_k_dim ** -0.5,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                )
         elif mode == 'chunk':
             o, recurrent_state = chunk_gated_delta_rule(
                 q=q,
