@@ -442,6 +442,115 @@ def chunk_gated_delta_rule(
     return o, final_state
 
 
+def _build_rank1_dc_chunk_transfer(
+    q_chunk: torch.Tensor,
+    k_chunk: torch.Tensor,
+    g_chunk: torch.Tensor,
+    beta_chunk: torch.Tensor,
+    lambda_q_chunk: torch.Tensor,
+    lambda_k_chunk: torch.Tensor,
+    scale: float,
+):
+    c, k_dim = k_chunk.shape
+    d = k_dim + 1
+    device = k_chunk.device
+    dtype = k_chunk.dtype
+
+    eye_k = torch.eye(k_dim, device=device, dtype=dtype)
+    eye_d = torch.eye(d, device=device, dtype=dtype)
+    ms = []
+    us = []
+    rs = []
+
+    for t in range(c):
+        phi_t = k_chunk[t]
+        alpha_t = g_chunk[t].exp()
+        beta_t = beta_chunk[t]
+        lambda_k_t = lambda_k_chunk[t]
+
+        m_t = torch.zeros(d, d, device=device, dtype=dtype)
+        m_t[:k_dim, :k_dim] = alpha_t * eye_k - beta_t * torch.outer(phi_t, phi_t)
+        m_t[:k_dim, k_dim] = beta_t * lambda_k_t * phi_t
+        m_t[k_dim, :k_dim] = -beta_t * phi_t
+        m_t[k_dim, k_dim] = alpha_t + beta_t * lambda_k_t
+        ms.append(m_t)
+
+        u_t = torch.empty(d, device=device, dtype=dtype)
+        u_t[:k_dim] = beta_t * phi_t
+        u_t[k_dim] = beta_t
+        us.append(u_t)
+
+        r_t = torch.empty(d, device=device, dtype=dtype)
+        r_t[:k_dim] = scale * q_chunk[t]
+        r_t[k_dim] = -lambda_q_chunk[t]
+        rs.append(r_t)
+
+    a_chunk = eye_d
+    r_chunk = torch.empty(c, d, device=device, dtype=dtype)
+    for t in range(c):
+        a_chunk = ms[t] @ a_chunk
+        r_chunk[t] = rs[t] @ a_chunk
+
+    l_chunk = torch.zeros(c, c, device=device, dtype=dtype)
+    p_chunk = torch.zeros(c, d, device=device, dtype=dtype)
+    for m in range(c):
+        z = us[m]
+        for t in range(m, c):
+            l_chunk[t, m] = torch.dot(rs[t], z)
+            if t == c - 1:
+                p_chunk[m] = z
+            else:
+                z = ms[t + 1] @ z
+
+    return a_chunk, r_chunk, l_chunk, p_chunk
+
+
+def _chunk_rank1_dc_triton_local(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    chunk_size: int,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None,
+    output_final_state: bool,
+):
+    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_rank1_dc
+
+    batch_size, seq_len = q.shape[:2]
+    v_dim = v.shape[-1]
+    o = torch.empty(batch_size, seq_len, q.shape[2], v_dim, device=v.device, dtype=v.dtype)
+    if initial_state is None:
+        state = torch.zeros(batch_size, q.shape[2], q.shape[3], v_dim, device=v.device, dtype=torch.float32)
+        bias_state = torch.zeros(batch_size, q.shape[2], v_dim, device=v.device, dtype=torch.float32)
+    else:
+        state, bias_state = initial_state
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        o_chunk, (state, bias_state) = fused_recurrent_gated_delta_rule_rank1_dc(
+            q=q[:, start:end],
+            k=k[:, start:end],
+            v=v[:, start:end],
+            g=g[:, start:end],
+            beta=beta[:, start:end],
+            lambda_q=lambda_q[:, start:end],
+            lambda_k=lambda_k[:, start:end],
+            scale=scale,
+            initial_state=(state, bias_state),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+        )
+        o[:, start:end] = o_chunk
+
+    if not output_final_state:
+        return o, None
+    return o, (state, bias_state)
+
+
 def _chunk_rank1_dc_single_sequence(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -455,23 +564,33 @@ def _chunk_rank1_dc_single_sequence(
     state: torch.Tensor,
     bias_state: torch.Tensor,
 ):
-    h = state
-    b = bias_state
-    H, T, K = q.shape
-    V = v.shape[-1]
-    o = torch.zeros(H, T, V, device=v.device, dtype=torch.float32)
+    h = state.clone()
+    b = bias_state.clone()
+    num_heads, seq_len, k_dim = q.shape
+    v_dim = v.shape[-1]
+    o = torch.zeros(num_heads, seq_len, v_dim, device=v.device, dtype=torch.float32)
 
-    for start in range(0, T, chunk_size):
-        end = min(start + chunk_size, T)
-        for i in range(start, end):
-            alpha = g[:, i].exp()
-            h = h * alpha[:, None, None]
-            b = b * alpha[:, None]
-            pred = (h * k[:, i, :, None]).sum(-2) - lambda_k[:, i, None] * b
-            delta = beta[:, i, None] * (v[:, i] - pred)
-            h = h + k[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
-            b = b + delta
-            o[:, i] = torch.einsum('hk,hkv->hv', q[:, i] * scale, h) - lambda_q[:, i, None] * b
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        for head_idx in range(num_heads):
+            a_chunk, r_chunk, l_chunk, p_chunk = _build_rank1_dc_chunk_transfer(
+                q_chunk=q[head_idx, start:end],
+                k_chunk=k[head_idx, start:end],
+                g_chunk=g[head_idx, start:end],
+                beta_chunk=beta[head_idx, start:end],
+                lambda_q_chunk=lambda_q[head_idx, start:end],
+                lambda_k_chunk=lambda_k[head_idx, start:end],
+                scale=scale,
+            )
+
+            x_in = torch.cat([h[head_idx], b[head_idx].unsqueeze(0)], dim=0)
+            v_chunk = v[head_idx, start:end]
+            x_out = a_chunk @ x_in + p_chunk.transpose(0, 1) @ v_chunk
+            y_chunk = r_chunk @ x_in + l_chunk @ v_chunk
+
+            h[head_idx] = x_out[:k_dim]
+            b[head_idx] = x_out[k_dim]
+            o[head_idx, start:end] = y_chunk
     return o, h, b
 
 
@@ -495,10 +614,32 @@ def chunk_gated_delta_rule_rank1_dc(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
+    use_triton_chunk_local = (
+        cu_seqlens is None
+        and q.is_cuda
+        and (not torch.is_grad_enabled())
+        and not any(x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k))
+    )
+
     q, k, v, g, beta, lambda_q, lambda_k = map(
         lambda x: x.to(torch.float32),
         [q, k, v, g, beta, lambda_q, lambda_k],
     )
+
+    if use_triton_chunk_local:
+        return _chunk_rank1_dc_triton_local(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            lambda_q=lambda_q,
+            lambda_k=lambda_k,
+            scale=scale,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -507,11 +648,11 @@ def chunk_gated_delta_rule_rank1_dc(
                 f"Please flatten variable-length inputs before processing."
             )
         num_seq = len(cu_seqlens) - 1
-        H, Kdim, Vdim = q.shape[2], q.shape[3], v.shape[-1]
-        o = torch.zeros(1, q.shape[1], H, Vdim, device=v.device, dtype=torch.float32)
+        num_heads, k_dim, v_dim = q.shape[2], q.shape[3], v.shape[-1]
+        o = torch.zeros(1, q.shape[1], num_heads, v_dim, device=v.device, dtype=torch.float32)
         if initial_state is None:
-            state = torch.zeros(num_seq, H, Kdim, Vdim, device=v.device, dtype=torch.float32)
-            bias_state = torch.zeros(num_seq, H, Vdim, device=v.device, dtype=torch.float32)
+            state = torch.zeros(num_seq, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
+            bias_state = torch.zeros(num_seq, num_heads, v_dim, device=v.device, dtype=torch.float32)
         else:
             state, bias_state = initial_state
             state = state.to(torch.float32)
@@ -538,16 +679,16 @@ def chunk_gated_delta_rule_rank1_dc(
             lambda x: x.transpose(1, 2).contiguous(),
             [q, k, v, g, beta, lambda_q, lambda_k],
         )
-        B, H, T, Kdim, Vdim = *k.shape, v.shape[-1]
-        o = torch.zeros(B, H, T, Vdim, device=v.device, dtype=torch.float32)
+        batch_size, num_heads, seq_len, k_dim, v_dim = *k.shape, v.shape[-1]
+        o = torch.zeros(batch_size, num_heads, seq_len, v_dim, device=v.device, dtype=torch.float32)
         if initial_state is None:
-            state = torch.zeros(B, H, Kdim, Vdim, device=v.device, dtype=torch.float32)
-            bias_state = torch.zeros(B, H, Vdim, device=v.device, dtype=torch.float32)
+            state = torch.zeros(batch_size, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
+            bias_state = torch.zeros(batch_size, num_heads, v_dim, device=v.device, dtype=torch.float32)
         else:
             state, bias_state = initial_state
             state = state.to(torch.float32)
             bias_state = bias_state.to(torch.float32)
-        for batch_idx in range(B):
+        for batch_idx in range(batch_size):
             o[batch_idx], state[batch_idx], bias_state[batch_idx] = _chunk_rank1_dc_single_sequence(
                 q=q[batch_idx],
                 k=k[batch_idx],
