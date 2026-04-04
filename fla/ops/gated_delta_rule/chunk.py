@@ -843,33 +843,16 @@ def _build_rank1_dc_chunk_transfer(
     rs[:, :k_dim] = scale * q_chunk
     rs[:, k_dim] = -lambda_q_chunk
 
-    a_chunk_wy = None
-    if k_chunk.is_cuda and not torch.is_grad_enabled():
-        alpha_bar, a_wy, b_wy, t_wy = _build_rank1_dc_wy_factors_triton(
-            k_chunk=k_chunk,
-            g_chunk=g_chunk,
-            beta_chunk=beta_chunk,
-            lambda_k_chunk=lambda_k_chunk,
-        )
-        t_inv_vt = torch.linalg.solve_triangular(t_wy, b_wy, upper=True)
-        a_chunk_wy = alpha_bar * (eye_d - a_wy.transpose(0, 1) @ t_inv_vt)
-
+    # The exact augmented recurrence is X_t = (alpha I - beta u_t c_t^T) X_{t-1} + beta u_t v_t^T.
+    # Keep the exact PyTorch path as ground truth until the WY factors are re-derived for this orientation.
     a_chunk = eye_d.clone()
     r_chunk = torch.empty(c, d, device=device, dtype=dtype)
-    if a_chunk_wy is None:
-        for t in range(c):
-            proj = torch.matmul(u_vecs[t], a_chunk)
-            a_chunk = alpha[t] * a_chunk - beta_chunk[t] * torch.outer(c_vecs[t], proj)
-            r_chunk[t] = torch.matmul(rs[t], a_chunk)
-    else:
-        a_chunk = a_chunk_wy
-        alpha_prefix = alpha.cumprod(0)
-        for t in range(c):
-            solve_prefix = torch.linalg.solve_triangular(t_wy[:t + 1, :t + 1], b_wy[:t + 1], upper=True)
-            a_prefix = alpha_prefix[t] * (eye_d - a_wy[:t + 1].transpose(0, 1) @ solve_prefix)
-            r_chunk[t] = torch.matmul(rs[t], a_prefix)
+    for t in range(c):
+        proj = torch.matmul(c_vecs[t], a_chunk)
+        a_chunk = alpha[t] * a_chunk - beta_chunk[t] * torch.outer(u_vecs[t], proj)
+        r_chunk[t] = torch.matmul(rs[t], a_chunk)
 
-    use_triton_cols = k_chunk.is_cuda and not torch.is_grad_enabled()
+    use_triton_cols = False
 
     l_chunk = torch.zeros(c, c, device=device, dtype=dtype)
     z_cols = torch.empty(d, c, device=device, dtype=dtype)
@@ -877,11 +860,11 @@ def _build_rank1_dc_chunk_transfer(
         if t > 0:
             if use_triton_cols:
                 l_chunk[t, :t] = _rank1_dc_update_cols_and_row_dot_fused_triton(
-                    z_cols[:, :t], u_vecs[t], c_vecs[t], rs[t], alpha[t], beta_chunk[t]
+                    z_cols[:, :t], c_vecs[t], u_vecs[t], rs[t], alpha[t], beta_chunk[t]
                 )
             else:
-                proj = torch.matmul(u_vecs[t], z_cols[:, :t])
-                z_cols[:, :t] = alpha[t] * z_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+                proj = torch.matmul(c_vecs[t], z_cols[:, :t])
+                z_cols[:, :t] = alpha[t] * z_cols[:, :t] - beta_chunk[t] * u_vecs[t][:, None] * proj[None, :]
                 l_chunk[t, :t] = torch.matmul(rs[t], z_cols[:, :t])
         z_cols[:, t] = p_vecs[t]
         l_chunk[t, t] = torch.dot(rs[t], p_vecs[t])
@@ -889,10 +872,10 @@ def _build_rank1_dc_chunk_transfer(
     p_cols = p_vecs.transpose(0, 1).contiguous()
     for t in range(c - 1, 0, -1):
         if use_triton_cols:
-            _rank1_dc_update_cols_fused_triton(p_cols[:, :t], u_vecs[t], c_vecs[t], alpha[t], beta_chunk[t])
+            _rank1_dc_update_cols_fused_triton(p_cols[:, :t], c_vecs[t], u_vecs[t], alpha[t], beta_chunk[t])
         else:
-            proj = torch.matmul(u_vecs[t], p_cols[:, :t])
-            p_cols[:, :t] = alpha[t] * p_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+            proj = torch.matmul(c_vecs[t], p_cols[:, :t])
+            p_cols[:, :t] = alpha[t] * p_cols[:, :t] - beta_chunk[t] * u_vecs[t][:, None] * proj[None, :]
     p_chunk = p_cols.transpose(0, 1).contiguous()
 
     return a_chunk, r_chunk, l_chunk, p_chunk
