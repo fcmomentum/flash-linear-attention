@@ -424,3 +424,145 @@ This separates the two mechanisms cleanly:
 ### Practical Takeaway
 
 To make centered DeltaNet "just like XSA," replace the global mean-direction subtraction with a token-dependent projection in value space. Strictly speaking, that produces an exclusive DeltaNet rather than a centered DeltaNet.
+
+## How the Rank-1 DC Removal Would Map to a Triton Kernel
+
+The recurrent rank-1 DC-removal update is
+
+$$
+\hat v_t = S_{t-1} \phi(k_t) - \lambda_k(t) b_{t-1},
+$$
+$$
+\delta_t = \beta_t (v_t - \hat v_t),
+$$
+$$
+S_t = \alpha_t S_{t-1} + \delta_t \phi(k_t)^\top,
+$$
+$$
+b_t = \alpha_t b_{t-1} + \delta_t,
+$$
+$$
+y_t = S_t \phi(q_t) - \lambda_q(t) b_t.
+$$
+
+Here:
+
+- \(S_t \in \mathbb{R}^{K \times V}\) is the usual DeltaNet state
+- \(b_t \in \mathbb{R}^{V}\) is the extra bias state
+- \(\lambda_k(t), \lambda_q(t)\) are scalar coefficients per token and head
+
+### Fused Recurrent Triton Kernel
+
+For the fused recurrent kernel, the implementation is conceptually straightforward.
+
+At each time step, the Triton kernel already holds one tile of the recurrent state \(S_t\) in SRAM/registers. To support rank-1 DC removal, it additionally keeps one vector tile of \(b_t\).
+
+The per-step kernel logic becomes:
+
+$$
+\text{pred}_t = S_{t-1} \phi(k_t) - \lambda_k(t) b_{t-1},
+$$
+$$
+\delta_t = \beta_t (v_t - \text{pred}_t),
+$$
+$$
+S_t = \alpha_t S_{t-1} + \delta_t \phi(k_t)^\top,
+$$
+$$
+b_t = \alpha_t b_{t-1} + \delta_t,
+$$
+$$
+y_t = S_t \phi(q_t) - \lambda_q(t) b_t.
+$$
+
+So compared to the standard fused recurrent kernel, the only additional state is one \(V\)-vector per head, and the only additional arithmetic is:
+
+- one subtraction using \(\lambda_k(t) b_{t-1}\) in prediction
+- one recurrence update for \(b_t\)
+- one subtraction using \(\lambda_q(t) b_t\) in readout
+
+This is a good fit for Triton because it preserves the same time-serial structure as the existing recurrent kernel.
+
+### Why the Chunked Kernel Is Harder
+
+The chunked Gated DeltaNet kernel is not a simple time loop over the recurrence. It relies on a chunk factorization that rewrites the recurrence into two parts:
+
+1. an intra-chunk triangular solve / scan
+2. an inter-chunk state carry
+
+This works cleanly for the standard DeltaNet update because the hidden state contribution can be represented entirely through the \(K \times V\) matrix state and the derived chunk quantities built from \(k\), \(\beta\), and the decay factors.
+
+The rank-1 DC-removal recurrence breaks that exact structure in two ways.
+
+First, the prediction is no longer purely
+
+$$
+S_{t-1} \phi(k_t),
+$$
+
+but instead
+
+$$
+S_{t-1} \phi(k_t) - \lambda_k(t) b_{t-1}.
+$$
+
+So the carry state is no longer just \(S_t\); it is the coupled pair
+
+$$
+(S_t, b_t).
+$$
+
+Second, the extra state \(b_t\) is updated with coefficient \(1\) in the write path,
+
+$$
+b_t = \alpha_t b_{t-1} + \delta_t,
+$$
+
+while the matrix state is updated with feature coefficient \(\phi(k_t)\),
+
+$$
+S_t = \alpha_t S_{t-1} + \delta_t \phi(k_t)^\top.
+$$
+
+That mismatch is exactly why the nonnegative approximation is cheap in the recurrent form but awkward in the chunked factorization. The chunk algorithm would need a matched reformulation that carries both:
+
+- the usual feature-weighted cumulative quantities for \(S_t\)
+- an additional unweighted cumulative quantity for \(b_t\)
+- the cross-term induced by \(\lambda_k(t) b_{t-1}\) inside the innovation
+
+### What a Chunked Triton Implementation Would Need
+
+A correct chunked implementation would therefore need to augment the chunk summary with an additional bias-state channel.
+
+At a minimum, each chunk would need to propagate:
+
+- the final matrix state contribution for \(S\)
+- the final vector state contribution for \(b\)
+- the intra-chunk correction induced by the \(\lambda_k(t) b_{t-1}\) term
+
+Operationally, that means the existing WY-style / chunk-scan preprocessing is no longer sufficient by itself. One needs a new factorization for the coupled recurrence.
+
+A useful way to think about it is that the recurrent state becomes an augmented object
+
+$$
+\mathcal{H}_t = (S_t, b_t),
+$$
+
+but the write coefficients are asymmetric:
+
+- \(S_t\) writes with \(\phi(k_t)\)
+- \(b_t\) writes with the constant coefficient \(1\)
+- prediction reads \(b_t\) with token-dependent coefficient \(\lambda_k(t)\)
+- output reads \(b_t\) with token-dependent coefficient \(\lambda_q(t)\)
+
+So a chunked kernel must derive a block recurrence for this augmented state, rather than trying to reuse the standard chunk algebra unchanged.
+
+### Practical Recommendation
+
+In implementation order, the sensible path is:
+
+1. implement and validate the fused recurrent Triton kernel first
+2. keep chunk mode on a reference fallback until the augmented chunk factorization is derived cleanly
+3. only then build a chunked Triton kernel for the coupled \((S_t, b_t)\) recurrence
+
+This is why the current prototype is naturally a recurrent reference path rather than a drop-in chunk-kernel modification. The recurrent kernel matches the math directly; the chunked kernel requires a new derivation.

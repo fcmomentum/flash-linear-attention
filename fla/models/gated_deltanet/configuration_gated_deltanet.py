@@ -16,6 +16,8 @@ class GatedDeltaNetConfig(PretrainedConfig):
         use_gate: bool = True,
         use_short_conv: bool = True,
         allow_neg_eigval: bool = False,
+        use_rank1_dc_removal: bool = False,
+        dc_removal_eps: float = 1e-6,
         conv_size: int = 4,
         head_dim: int = 256,
         num_heads: int = 6,
@@ -68,6 +70,8 @@ class GatedDeltaNetConfig(PretrainedConfig):
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
         self.allow_neg_eigval = allow_neg_eigval
+        self.use_rank1_dc_removal = use_rank1_dc_removal
+        self.dc_removal_eps = dc_removal_eps
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(

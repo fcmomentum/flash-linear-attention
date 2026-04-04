@@ -13,7 +13,11 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.gated_delta_rule import (
+    chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule,
+    naive_recurrent_gated_delta_rule_rank1_dc,
+)
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -96,6 +100,8 @@ class GatedDeltaNet(nn.Module):
         use_gate: bool = True,
         use_short_conv: bool = True,
         allow_neg_eigval: bool = False,
+        use_rank1_dc_removal: bool = False,
+        dc_removal_eps: float = 1e-6,
         conv_size: int = 4,
         conv_bias: bool = False,
         layer_idx: int = None,
@@ -106,6 +112,8 @@ class GatedDeltaNet(nn.Module):
 
         self.mode = mode
         self.allow_neg_eigval = allow_neg_eigval
+        self.use_rank1_dc_removal = use_rank1_dc_removal
+        self.dc_removal_eps = dc_removal_eps
         self.hidden_size = hidden_size
         self.expand_v = expand_v
 
@@ -199,6 +207,9 @@ class GatedDeltaNet(nn.Module):
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
+        if self.use_rank1_dc_removal:
+            self.dc_removal_nu_logit = nn.Parameter(torch.zeros(self.num_v_heads, self.head_k_dim))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -268,7 +279,29 @@ class GatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        if mode == 'chunk':
+        if self.use_rank1_dc_removal:
+            q = F.normalize(q, p=2, dim=-1, eps=self.dc_removal_eps)
+            k = F.normalize(k, p=2, dim=-1, eps=self.dc_removal_eps)
+            nu = F.softplus(self.dc_removal_nu_logit).to(q.dtype) + self.dc_removal_eps
+            nu = nu / nu.norm(dim=-1, keepdim=True).clamp_min(self.dc_removal_eps)
+            nu_sq = nu.square().sum(-1).clamp_min(self.dc_removal_eps)
+            lambda_k = (k * nu.unsqueeze(0).unsqueeze(0)).sum(-1) / nu_sq.unsqueeze(0).unsqueeze(0)
+            q_scaled = q * (self.head_k_dim ** -0.5)
+            lambda_q = (q_scaled * nu.unsqueeze(0).unsqueeze(0)).sum(-1) / nu_sq.unsqueeze(0).unsqueeze(0)
+            o, recurrent_state = naive_recurrent_gated_delta_rule_rank1_dc(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
+                scale=self.head_k_dim ** -0.5,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+        elif mode == 'chunk':
             o, recurrent_state = chunk_gated_delta_rule(
                 q=q,
                 k=k,

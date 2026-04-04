@@ -5,6 +5,30 @@ import torch.nn.functional as F
 from einops import rearrange
 
 
+def _run_recurrent_gated_delta_rule_single_sequence(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    scale: float,
+    h: torch.Tensor,
+):
+    H, T, K = q.shape
+    V = v.shape[-1]
+    o = torch.zeros(H, T, V, device=v.device, dtype=torch.float32)
+
+    for i in range(T):
+        b_q = q[:, i]
+        b_k = k[:, i]
+        b_v = v[:, i]
+        h = h * g[:, i].exp()[:, None, None]
+        delta = beta[:, i, None] * (b_v - (h * b_k[..., None]).sum(-2))
+        h = h + b_k.unsqueeze(-1) * delta.unsqueeze(-2)
+        o[:, i] = torch.einsum('hk,hkv->hv', b_q * scale, h)
+    return o, h
+
+
 def naive_recurrent_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -32,31 +56,173 @@ def naive_recurrent_gated_delta_rule(
         o: [B, T, H, V]
         final_state: [B, H, K, V] if output_final_state else None
     """
+    orig_dtype = v.dtype
     q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g])
     B, H, T, K, V = *k.shape, v.shape[-1]
-    o = torch.zeros(B, H, T, V).to(v)
-    h = torch.zeros(B, H, K, V).to(v)
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+
+    o = torch.zeros(B, H, T, V, device=v.device, dtype=torch.float32)
+    h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
     if initial_state is not None:
         h = initial_state.to(torch.float32)
-    if scale is None:
-        scale = 1 / (q.shape[-1] ** 0.5)
-    q = q * scale
 
-    for i in range(T):
-        b_q = q[:, :, i]
-        b_k = k[:, :, i]
-        b_v = v[:, :, i].clone()
-        h = h.clone() * g[:, :, i].exp()[..., None, None]
-        b_beta = beta[:, :, i]
-        b_v = b_v - (h.clone() * b_k[..., None]).sum(-2)
-        b_v = b_v * b_beta[..., None]
-        h = h.clone() + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
-        o[:, :, i] = torch.einsum('bhd,bhdm->bhm', b_q, h)
+    for b in range(B):
+        o[b], h[b] = _run_recurrent_gated_delta_rule_single_sequence(
+            q=q[b],
+            k=k[b],
+            v=v[b],
+            beta=beta[b],
+            g=g[b],
+            scale=scale,
+            h=h[b],
+        )
 
     if not output_final_state:
         h = None
-    o = o.transpose(1, 2).contiguous()
+    o = o.transpose(1, 2).contiguous().to(orig_dtype)
     return o, h
+
+
+def _run_rank1_dc_single_sequence(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    h: torch.Tensor,
+    b: torch.Tensor,
+):
+    H, T, K = q.shape
+    V = v.shape[-1]
+    o = torch.zeros(H, T, V, device=v.device, dtype=torch.float32)
+
+    for i in range(T):
+        b_q = q[:, i]
+        b_k = k[:, i]
+        b_v = v[:, i]
+        alpha = g[:, i].exp()
+        h = h * alpha[:, None, None]
+        b = b * alpha[:, None]
+        pred = (h * b_k[..., None]).sum(-2) - lambda_k[:, i, None] * b
+        delta = beta[:, i, None] * (b_v - pred)
+        h = h + b_k.unsqueeze(-1) * delta.unsqueeze(-2)
+        b = b + delta
+        o[:, i] = torch.einsum('hk,hkv->hv', b_q * scale, h) - lambda_q[:, i, None] * b
+    return o, h, b
+
+
+def naive_recurrent_gated_delta_rule_rank1_dc(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float = None,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    """
+    Reference PyTorch implementation of gated delta rule with rank-1 DC removal.
+
+    Args:
+        q: [B, T, H, K]
+        k: [B, T, H, K]
+        v: [B, T, H, V]
+        beta: [B, T, H]
+        g: [B, T, H]
+        lambda_q: [B, T, H]
+        lambda_k: [B, T, H]
+        scale: float, optional
+        initial_state: tuple(state, bias_state), where
+            state has shape [N, H, K, V] and bias_state has shape [N, H, V]
+        output_final_state: bool
+        cu_seqlens: optional cumulative sequence lengths for flattened varlen inputs
+
+    Returns:
+        o: [B, T, H, V]
+        final_state: tuple(final_state, final_bias_state) if output_final_state else None
+    """
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+
+    orig_dtype = v.dtype
+    q, k, v, beta, g, lambda_q, lambda_k = map(
+        lambda x: x.to(torch.float32),
+        [q, k, v, beta, g, lambda_q, lambda_k],
+    )
+
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError("Expected batch size 1 when `cu_seqlens` is provided.")
+        total = q.shape[1]
+        H, K, V = q.shape[2], q.shape[3], v.shape[-1]
+        o = torch.zeros(1, total, H, V, device=v.device, dtype=torch.float32)
+        num_seq = len(cu_seqlens) - 1
+        h = torch.zeros(num_seq, H, K, V, device=v.device, dtype=torch.float32)
+        b = torch.zeros(num_seq, H, V, device=v.device, dtype=torch.float32)
+        if initial_state is not None:
+            h = initial_state[0].to(torch.float32)
+            b = initial_state[1].to(torch.float32)
+        for n in range(num_seq):
+            bos = int(cu_seqlens[n].item())
+            eos = int(cu_seqlens[n + 1].item())
+            q_n = q[0, bos:eos].transpose(0, 1).contiguous()
+            k_n = k[0, bos:eos].transpose(0, 1).contiguous()
+            v_n = v[0, bos:eos].transpose(0, 1).contiguous()
+            beta_n = beta[0, bos:eos].transpose(0, 1).contiguous()
+            g_n = g[0, bos:eos].transpose(0, 1).contiguous()
+            lambda_q_n = lambda_q[0, bos:eos].transpose(0, 1).contiguous()
+            lambda_k_n = lambda_k[0, bos:eos].transpose(0, 1).contiguous()
+            o_n, h[n], b[n] = _run_rank1_dc_single_sequence(
+                q=q_n,
+                k=k_n,
+                v=v_n,
+                beta=beta_n,
+                g=g_n,
+                lambda_q=lambda_q_n,
+                lambda_k=lambda_k_n,
+                scale=scale,
+                h=h[n],
+                b=b[n],
+            )
+            o[0, bos:eos] = o_n.transpose(0, 1)
+    else:
+        q, k, v, beta, g, lambda_q, lambda_k = map(
+            lambda x: x.transpose(1, 2).contiguous(),
+            [q, k, v, beta, g, lambda_q, lambda_k],
+        )
+        B, H, T, K, V = *k.shape, v.shape[-1]
+        o = torch.zeros(B, H, T, V, device=v.device, dtype=torch.float32)
+        h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
+        b = torch.zeros(B, H, V, device=v.device, dtype=torch.float32)
+        if initial_state is not None:
+            h = initial_state[0].to(torch.float32)
+            b = initial_state[1].to(torch.float32)
+        for batch_idx in range(B):
+            o[batch_idx], h[batch_idx], b[batch_idx] = _run_rank1_dc_single_sequence(
+                q=q[batch_idx],
+                k=k[batch_idx],
+                v=v[batch_idx],
+                beta=beta[batch_idx],
+                g=g[batch_idx],
+                lambda_q=lambda_q[batch_idx],
+                lambda_k=lambda_k[batch_idx],
+                scale=scale,
+                h=h[batch_idx],
+                b=b[batch_idx],
+            )
+        o = o.transpose(1, 2).contiguous()
+
+    if not output_final_state:
+        return o.to(orig_dtype), None
+    return o.to(orig_dtype), (h, b)
 
 
 def naive_chunk_gated_delta_rule(
