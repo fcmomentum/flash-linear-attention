@@ -1044,3 +1044,464 @@ A proper chunked kernel therefore needs three derived objects per chunk:
 Once these are derived, the inter-chunk scan is well-defined and associative.
 
 That is the actual derivation target for a mathematically correct chunked rank-1 DC-removal kernel.
+
+## What "Blocked Low-Rank Factorization" Means Here
+
+When we say the chunked implementation should use a blocked low-rank factorization, we mean the following.
+
+The exact augmented chunk transfer is
+
+$$
+X_{\mathrm{out}} = A_{\mathrm{chunk}} X_{\mathrm{in}} + P_{\mathrm{chunk}}^\top V_{\mathrm{chunk}},
+$$
+$$
+Y_{\mathrm{chunk}} = R_{\mathrm{chunk}} X_{\mathrm{in}} + L_{\mathrm{chunk}} V_{\mathrm{chunk}},
+$$
+
+with augmented state
+
+$$
+X = \begin{bmatrix} S \\ b \end{bmatrix}.
+$$
+
+A naive implementation would explicitly materialize the full chunk transfer \(A_{\mathrm{chunk}}\). That is mathematically correct, but it is not the right object for a fast kernel, because \(A_{\mathrm{chunk}}\) acts on the full augmented state and is much denser than the structure of the recurrence actually requires.
+
+The goal of a blocked low-rank factorization is to keep the block structure of the augmented state while storing only the low-rank factors that the recurrence actually uses.
+
+### 1. Block Structure of the Augmented Transfer
+
+The augmented state splits naturally into
+
+- matrix state \(S\)
+- bias state \(b\)
+
+So the exact chunk transfer has block form
+
+$$
+A_{\mathrm{chunk}} =
+\begin{bmatrix}
+A_{SS} & A_{Sb} \\
+A_{bS} & A_{bb}
+\end{bmatrix}.
+$$
+
+Here:
+
+- \(A_{SS}\) maps incoming \(S\) to outgoing \(S\)
+- \(A_{Sb}\) maps incoming \(b\) to outgoing \(S\)
+- \(A_{bS}\) maps incoming \(S\) to outgoing \(b\)
+- \(A_{bb}\) maps incoming \(b\) to outgoing \(b\)
+
+This is the "blocked" part.
+
+### 2. Why the Cross Blocks Are Low-Rank
+
+Look back at the per-step recurrence:
+
+$$
+S_t = \alpha_t S_{t-1} - \beta_t (S_{t-1}\phi_t) \phi_t^\top + \beta_t \lambda_t b_{t-1} \phi_t^\top + \beta_t v_t \phi_t^\top,
+$$
+
+$$
+b_t = \alpha_t b_{t-1} - \beta_t S_{t-1}\phi_t + \beta_t \lambda_t b_{t-1} + \beta_t v_t.
+$$
+
+The crucial observation is:
+
+- the coupling from \(b\) into \(S\) always appears as
+  $$
+  \beta_t \lambda_t b_{t-1} \phi_t^\top
+  $$
+  which is rank-1 in the feature direction \(\phi_t\)
+- the coupling from \(S\) into \(b\) always appears as
+  $$
+  -\beta_t S_{t-1}\phi_t
+  $$
+  which depends on \(S\) only through the single projected vector \(S_{t-1}\phi_t\)
+
+So neither cross block is an arbitrary dense map. Both are structured through one feature direction per token. That is the "low-rank" part.
+
+Important: low-rank does not automatically mean approximate. There are three distinct cases:
+
+- dense representation: exact but expensive
+- factorized representation: still exact, but stored/applied through structured factors
+- truncated factorized representation: approximate
+
+The mathematical goal here is the second case. In other words, the chunk kernel should try to represent the exact blocks \(A_{Sb}\) and \(A_{bS}\) through exact structured factors if possible, rather than replacing them with approximations by default.
+
+### 3. What Should Be Factorized Instead of Materialized
+
+Rather than storing the full dense blocks \(A_{Sb}\) and \(A_{bS}\), the chunked algorithm should try to store factors of the form:
+
+$$
+A_{Sb}(b) \approx U_{Sb} \bigl(C_{Sb} b\bigr),
+$$
+
+$$
+A_{bS}(S) \approx U_{bS} \bigl(C_{bS}(S)\bigr),
+$$
+
+where:
+
+- \(U_{Sb}\) carries the feature-space write directions into \(S\)
+- \(C_{Sb}\) carries the scalar/vector coefficients coming from the bias state
+- \(C_{bS}(S)\) extracts the projected directions of \(S\) that matter for \(b\)
+
+In other words, the chunk kernel should propagate the factors needed to apply these maps, rather than the full maps themselves.
+
+### 4. Relation to the Old WY-Style DeltaNet Factorization
+
+For the old chunked Gated Delta Rule, the intra-chunk algebra is compressed into the WY-style objects `w`, `u`, and `A`.
+
+That works because the standard recurrence only needs the \(S \to S\) block, and both prediction and write are organized around the same feature direction \(\phi_t\).
+
+For the augmented recurrence, the analogous compressed representation would need to extend that idea to include:
+
+- the original \(S \to S\) summary
+- a compressed summary for \(b \to S\)
+- a compressed summary for \(S \to b\)
+- a compressed summary for \(b \to b\)
+
+The point is not to build a dense augmented matrix. The point is to find the analogue of `w`, `u`, and `A` for the new block-coupled recurrence.
+
+### 5. A More Concrete Factorization Target
+
+A useful target form is:
+
+$$
+S_{\mathrm{out}} = A_{SS}(S_{\mathrm{in}}) + U_{Sb} z_b + c_S,
+$$
+
+$$
+b_{\mathrm{out}} = z_S + A_{bb}(b_{\mathrm{in}}) + c_b,
+$$
+
+where:
+
+- \(U_{Sb}\) collects a small number of feature-space output directions
+- \(z_b\) is a compressed coefficient vector derived from incoming \(b\)
+- \(z_S\) is a compressed projection of incoming \(S\)
+
+The same idea applies to the local readout:
+
+$$
+Y_{\mathrm{chunk}} = R_S(S_{\mathrm{in}}) + R_b(b_{\mathrm{in}}) + L_{\mathrm{chunk}} V_{\mathrm{chunk}}.
+$$
+
+Again, the aim is to represent \(R_S\) and \(R_b\) through projected/factored forms rather than dense operators.
+
+### 6. Why This Matters for Triton
+
+A Triton kernel is efficient when the computation can be written as:
+
+- structured matrix-vector or small matrix-matrix operations
+- low-rank updates
+- triangular/block solves with compact summaries
+
+A dense augmented transfer on \((K+1)\)-dimensional state per value channel is the wrong shape. The blocked low-rank factorization is the algebraic step that turns the exact chunked derivation into something kernel-friendly.
+
+### 7. Practical Meaning
+
+So when we say "derive a blocked low-rank factorization," we mean:
+
+1. start from the exact augmented block recurrence
+2. isolate the four transfer blocks \(A_{SS}, A_{Sb}, A_{bS}, A_{bb}\)
+3. prove which of those blocks can be represented through low-rank factors and projected summaries
+4. implement kernels for those factors, not for the dense augmented operator
+
+That is the mathematical bridge between the exact chunk-transfer derivation and a truly optimized chunk Triton kernel.
+
+## Exact WY-Style Product Formula for the Augmented Step Matrices
+
+We now derive the exact structured product formula for the augmented per-step transfer matrices.
+
+From the previous section, the augmented recurrence can be written as
+
+$$
+H_t = H_{t-1} M_t + v_t p_t^\top,
+$$
+
+with
+
+$$
+M_t = \alpha_t I_{K+1} - \beta_t c_t u_t^\top,
+$$
+
+where
+
+$$
+c_t = \begin{bmatrix} \phi_t \\ -\lambda_t \end{bmatrix},
+\qquad
+u_t = \begin{bmatrix} \phi_t \\ 1 \end{bmatrix},
+\qquad
+p_t = \beta_t u_t.
+$$
+
+To avoid confusion, in this section we use \(u_t\) for the augmented write vector:
+
+$$
+u_t := u_t = \begin{bmatrix} \phi_t \\ 1 \end{bmatrix}.
+$$
+
+So the transfer matrix is
+
+$$
+M_t = \alpha_t I_{K+1} - \beta_t c_t \nu_t^\top.
+$$
+
+### 1. Factor Out the Scalar Decay
+
+Since \(\alpha_t\) is scalar,
+
+$$
+M_t = \alpha_t \left(I_{K+1} - \gamma_t c_t \nu_t^\top\right),
+\qquad
+\gamma_t := \frac{\beta_t}{\alpha_t}.
+$$
+
+Thus the full chunk product is
+
+$$
+A_{\mathrm{chunk}} = M_1 M_2 \cdots M_C
+= \left(\prod_{t=1}^C \alpha_t\right)
+\prod_{t=1}^C \left(I_{K+1} - a_t b_t^\top\right),
+$$
+
+where we define
+
+$$
+a_t := \gamma_t c_t,
+\qquad
+b_t := \nu_t.
+$$
+
+So the problem reduces to the product of rank-1 updates to the identity.
+
+### 2. Exact Product of Rank-1 Updates
+
+For matrices of the form
+
+$$
+F_t := I - a_t b_t^\top,
+$$
+
+the exact product admits a WY-style representation:
+
+$$
+F_1 F_2 \cdots F_C = I - U T^{-1} V^\top,
+$$
+
+where
+
+$$
+U = \begin{bmatrix} a_1 & a_2 & \cdots & a_C \end{bmatrix},
+\qquad
+V = \begin{bmatrix} b_1 & b_2 & \cdots & b_C \end{bmatrix},
+$$
+
+and \(T\) is the upper-triangular matrix defined by
+
+$$
+T_{ii} = 1,
+$$
+$$
+T_{ij} = b_i^\top a_j \quad \text{for } i < j,
+$$
+$$
+T_{ij} = 0 \quad \text{for } i > j.
+$$
+
+This identity is exact.
+
+Therefore the chunk transfer becomes
+
+$$
+A_{\mathrm{chunk}}
+= \bar\alpha_{1:C} \left(I - U T^{-1} V^\top\right),
+$$
+
+with
+
+$$
+\bar\alpha_{1:C} := \prod_{t=1}^C \alpha_t.
+$$
+
+This is the exact structured factorization of the chunk carry.
+
+### 3. Why This Is the Right Analogue of the Old Chunk Summary
+
+This formula is the exact analogue of the old WY-style compression used by standard chunked DeltaNet.
+
+The difference is only that the feature dimension is now augmented from \(K\) to \(K+1\), and the step vectors are
+
+$$
+a_t = \frac{\beta_t}{\alpha_t}
+\begin{bmatrix}
+\phi_t \\ -\lambda_t
+\end{bmatrix},
+\qquad
+b_t =
+\begin{bmatrix}
+\phi_t \\ 1
+\end{bmatrix}.
+$$
+
+So the exact chunk carry is still a diagonal decay times a structured low-rank correction.
+
+### 4. Exact Formula for the Final-State Chunk Transfer
+
+Using the WY form,
+
+$$
+H_{\mathrm{out}} = H_{\mathrm{in}} A_{\mathrm{chunk}} + V_{\mathrm{chunk}}^\top P_{\mathrm{chunk}},
+$$
+
+where
+
+$$
+A_{\mathrm{chunk}} = \bar\alpha_{1:C} \left(I - U T^{-1} V^\top\right).
+$$
+
+The remaining object \(P_{\mathrm{chunk}}\) collects how each local value vector contributes to the final state.
+
+For token \(m\), its contribution is
+
+$$
+P_m^\top = p_m^\top M_{m+1} M_{m+2} \cdots M_C.
+$$
+
+So each suffix product also has the same WY form:
+
+$$
+M_{m+1} \cdots M_C
+= \bar\alpha_{m+1:C}
+\left(I - U_{m+1:C} T_{m+1:C}^{-1} V_{m+1:C}^\top\right).
+$$
+
+Therefore
+
+$$
+P_m^\top
+= \beta_m \bar\alpha_{m+1:C}
+\nu_m^\top
+\left(I - U_{m+1:C} T_{m+1:C}^{-1} V_{m+1:C}^\top\right).
+$$
+
+This is exact.
+
+### 5. Exact Formula for the Readout Summary
+
+For local timestep \(t\), the output uses
+
+$$
+y_t = H_t r_t,
+$$
+
+with
+
+$$
+r_t = \begin{bmatrix} \psi_t \\ -\mu_t \end{bmatrix}.
+$$
+
+The incoming-state contribution is
+
+$$
+R_t = A_t r_t,
+$$
+
+where
+
+$$
+A_t = M_1 M_2 \cdots M_t.
+$$
+
+Again using the WY form,
+
+$$
+A_t = \bar\alpha_{1:t}
+\left(I - U_{1:t} T_{1:t}^{-1} V_{1:t}^\top\right),
+$$
+
+so
+
+$$
+R_t = \bar\alpha_{1:t}
+\left(I - U_{1:t} T_{1:t}^{-1} V_{1:t}^\top\right) r_t.
+$$
+
+This gives the exact incoming-state-to-output summary.
+
+### 6. Exact Formula for the Local Value-to-Output Coupling
+
+For \(m \le t\), the contribution of value \(v_m\) to output \(y_t\) is
+
+$$
+L_{t,m} = P_{m \to t}^\top r_t,
+$$
+
+where
+
+$$
+P_{m \to t}^\top = p_m^\top M_{m+1} M_{m+2} \cdots M_t.
+$$
+
+Using the suffix-prefix WY form,
+
+$$
+P_{m \to t}^\top
+= \beta_m \bar\alpha_{m+1:t}
+\nu_m^\top
+\left(I - U_{m+1:t} T_{m+1:t}^{-1} V_{m+1:t}^\top\right).
+$$
+
+Therefore
+
+$$
+L_{t,m}
+= \beta_m \bar\alpha_{m+1:t}
+\nu_m^\top
+\left(I - U_{m+1:t} T_{m+1:t}^{-1} V_{m+1:t}^\top\right)
+r_t.
+$$
+
+This is the exact lower-triangular local output coupling.
+
+### 7. What the Optimized Chunk Kernel Should Compute
+
+So the exact structured chunk objects are:
+
+- the chunk carry
+  $$
+  A_{\mathrm{chunk}} = \bar\alpha_{1:C}(I - U T^{-1} V^\top)
+  $$
+- the final-state write summary \(P_{\mathrm{chunk}}\)
+- the incoming-state read summary \(R_{\mathrm{chunk}}\)
+- the local lower-triangular coupling \(L_{\mathrm{chunk}}\)
+
+All of these are exact and derived from the same WY-style factors built from the augmented vectors
+
+$$
+a_t = \frac{\beta_t}{\alpha_t} c_t,
+\qquad
+b_t = \nu_t.
+$$
+
+### 8. Exact Factorized Does Not Mean Approximate
+
+This construction is still exact.
+
+It is factorized because it stores the chunk transfer through structured factors \((U, T, V)\) instead of a dense augmented matrix.
+
+It only becomes approximate if one later truncates, drops, or simplifies those factors for efficiency.
+
+### 9. The Remaining Implementation Gap
+
+This derivation gives the exact object that an optimized chunk Triton kernel should compute.
+
+What remains is not more recurrence algebra. What remains is kernel design:
+
+- how to build the augmented WY factors efficiently per chunk
+- how to apply them to obtain \(A_{\mathrm{chunk}}\), \(P_{\mathrm{chunk}}\), \(R_{\mathrm{chunk}}\), and \(L_{\mathrm{chunk}}\) without materializing dense operators
+- how to map that computation onto Triton tiles efficiently
+
+That is the final bridge from the exact math to the fully optimized chunk kernel.

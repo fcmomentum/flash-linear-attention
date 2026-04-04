@@ -3,6 +3,8 @@
 import warnings
 
 import torch
+import triton
+import triton.language as tl
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
@@ -362,6 +364,8 @@ def chunk_gated_delta_rule(
 
     Examples::
         >>> import torch
+import triton
+import triton.language as tl
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
         >>> from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -442,6 +446,80 @@ def chunk_gated_delta_rule(
     return o, final_state
 
 
+@triton.jit
+def _rank1_dc_build_t_kernel(
+    a_ptr,
+    b_ptr,
+    t_ptr,
+    c,
+    d,
+    stride_a0,
+    stride_a1,
+    stride_b0,
+    stride_b1,
+    stride_t0,
+    stride_t1,
+    BLOCK_C: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_i = tl.program_id(0)
+    pid_j = tl.program_id(1)
+    offs_i = pid_i * BLOCK_C + tl.arange(0, BLOCK_C)
+    offs_j = pid_j * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_i = offs_i < c
+    mask_j = offs_j < c
+    acc = tl.zeros([BLOCK_C, BLOCK_C], dtype=tl.float32)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        a = tl.load(a_ptr + offs_i[:, None] * stride_a0 + offs_d[None, :] * stride_a1, mask=mask_i[:, None] & mask_d[None, :], other=0.)
+        b = tl.load(b_ptr + offs_j[:, None] * stride_b0 + offs_d[None, :] * stride_b1, mask=mask_j[:, None] & mask_d[None, :], other=0.)
+        acc += tl.dot(a, tl.trans(b))
+    upper = offs_i[:, None] < offs_j[None, :]
+    diag = offs_i[:, None] == offs_j[None, :]
+    out = tl.where(diag, 1.0, tl.where(upper, acc, 0.0))
+    tl.store(t_ptr + offs_i[:, None] * stride_t0 + offs_j[None, :] * stride_t1, out, mask=mask_i[:, None] & mask_j[None, :])
+
+
+def _build_rank1_dc_wy_factors_triton(
+    k_chunk: torch.Tensor,
+    g_chunk: torch.Tensor,
+    beta_chunk: torch.Tensor,
+    lambda_k_chunk: torch.Tensor,
+):
+    c, k_dim = k_chunk.shape
+    d = k_dim + 1
+    device = k_chunk.device
+    dtype = k_chunk.dtype
+
+    alpha = g_chunk.exp()
+    gamma = beta_chunk / alpha.clamp_min(1e-6)
+    a = torch.empty(c, d, device=device, dtype=dtype)
+    b = torch.empty(c, d, device=device, dtype=dtype)
+    a[:, :k_dim] = gamma[:, None] * k_chunk
+    a[:, k_dim] = -gamma * lambda_k_chunk
+    b[:, :k_dim] = k_chunk
+    b[:, k_dim] = 1
+
+    t = torch.empty(c, c, device=device, dtype=torch.float32)
+    block_c = 32
+    block_d = 32
+    grid = (triton.cdiv(c, block_c), triton.cdiv(c, block_c))
+    _rank1_dc_build_t_kernel[grid](
+        a, b, t,
+        c, d,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        t.stride(0), t.stride(1),
+        BLOCK_C=block_c,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+    alpha_bar = alpha.prod()
+    return alpha_bar, a, b, t
+
+
 def _build_rank1_dc_chunk_transfer(
     q_chunk: torch.Tensor,
     k_chunk: torch.Tensor,
@@ -456,51 +534,63 @@ def _build_rank1_dc_chunk_transfer(
     device = k_chunk.device
     dtype = k_chunk.dtype
 
-    eye_k = torch.eye(k_dim, device=device, dtype=dtype)
     eye_d = torch.eye(d, device=device, dtype=dtype)
-    ms = []
-    us = []
-    rs = []
+    alpha = g_chunk.exp()
 
-    for t in range(c):
-        phi_t = k_chunk[t]
-        alpha_t = g_chunk[t].exp()
-        beta_t = beta_chunk[t]
-        lambda_k_t = lambda_k_chunk[t]
+    c_vecs = torch.empty(c, d, device=device, dtype=dtype)
+    u_vecs = torch.empty(c, d, device=device, dtype=dtype)
+    p_vecs = torch.empty(c, d, device=device, dtype=dtype)
+    rs = torch.empty(c, d, device=device, dtype=dtype)
 
-        m_t = torch.zeros(d, d, device=device, dtype=dtype)
-        m_t[:k_dim, :k_dim] = alpha_t * eye_k - beta_t * torch.outer(phi_t, phi_t)
-        m_t[:k_dim, k_dim] = beta_t * lambda_k_t * phi_t
-        m_t[k_dim, :k_dim] = -beta_t * phi_t
-        m_t[k_dim, k_dim] = alpha_t + beta_t * lambda_k_t
-        ms.append(m_t)
+    c_vecs[:, :k_dim] = k_chunk
+    c_vecs[:, k_dim] = -lambda_k_chunk
+    u_vecs[:, :k_dim] = k_chunk
+    u_vecs[:, k_dim] = 1
+    p_vecs[:, :k_dim] = beta_chunk[:, None] * k_chunk
+    p_vecs[:, k_dim] = beta_chunk
+    rs[:, :k_dim] = scale * q_chunk
+    rs[:, k_dim] = -lambda_q_chunk
 
-        u_t = torch.empty(d, device=device, dtype=dtype)
-        u_t[:k_dim] = beta_t * phi_t
-        u_t[k_dim] = beta_t
-        us.append(u_t)
+    a_chunk_wy = None
+    if k_chunk.is_cuda and not torch.is_grad_enabled():
+        alpha_bar, a_wy, b_wy, t_wy = _build_rank1_dc_wy_factors_triton(
+            k_chunk=k_chunk,
+            g_chunk=g_chunk,
+            beta_chunk=beta_chunk,
+            lambda_k_chunk=lambda_k_chunk,
+        )
+        t_inv_vt = torch.linalg.solve_triangular(t_wy, b_wy, upper=True)
+        a_chunk_wy = alpha_bar * (eye_d - a_wy.transpose(0, 1) @ t_inv_vt)
 
-        r_t = torch.empty(d, device=device, dtype=dtype)
-        r_t[:k_dim] = scale * q_chunk[t]
-        r_t[k_dim] = -lambda_q_chunk[t]
-        rs.append(r_t)
-
-    a_chunk = eye_d
+    a_chunk = eye_d.clone()
     r_chunk = torch.empty(c, d, device=device, dtype=dtype)
-    for t in range(c):
-        a_chunk = ms[t] @ a_chunk
-        r_chunk[t] = rs[t] @ a_chunk
+    if a_chunk_wy is None:
+        for t in range(c):
+            proj = torch.matmul(u_vecs[t], a_chunk)
+            a_chunk = alpha[t] * a_chunk - beta_chunk[t] * torch.outer(c_vecs[t], proj)
+            r_chunk[t] = torch.matmul(rs[t], a_chunk)
+    else:
+        a_chunk = a_chunk_wy
+        alpha_prefix = alpha.cumprod(0)
+        for t in range(c):
+            solve_prefix = torch.linalg.solve_triangular(t_wy[:t + 1, :t + 1], b_wy[:t + 1], upper=True)
+            a_prefix = alpha_prefix[t] * (eye_d - a_wy[:t + 1].transpose(0, 1) @ solve_prefix)
+            r_chunk[t] = torch.matmul(rs[t], a_prefix)
 
     l_chunk = torch.zeros(c, c, device=device, dtype=dtype)
-    p_chunk = torch.zeros(c, d, device=device, dtype=dtype)
-    for m in range(c):
-        z = us[m]
-        for t in range(m, c):
-            l_chunk[t, m] = torch.dot(rs[t], z)
-            if t == c - 1:
-                p_chunk[m] = z
-            else:
-                z = ms[t + 1] @ z
+    z_cols = torch.empty(d, c, device=device, dtype=dtype)
+    for t in range(c):
+        if t > 0:
+            proj = torch.matmul(u_vecs[t], z_cols[:, :t])
+            z_cols[:, :t] = alpha[t] * z_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+        z_cols[:, t] = p_vecs[t]
+        l_chunk[t, :t + 1] = torch.matmul(rs[t], z_cols[:, :t + 1])
+
+    p_cols = p_vecs.transpose(0, 1).contiguous()
+    for t in range(c - 1, 0, -1):
+        proj = torch.matmul(u_vecs[t], p_cols[:, :t])
+        p_cols[:, :t] = alpha[t] * p_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+    p_chunk = p_cols.transpose(0, 1).contiguous()
 
     return a_chunk, r_chunk, l_chunk, p_chunk
 
