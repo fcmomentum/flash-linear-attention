@@ -447,6 +447,298 @@ import triton.language as tl
 
 
 @triton.jit
+def _rank1_dc_project_cols_kernel(
+    z_ptr,
+    u_ptr,
+    out_ptr,
+    n,
+    d,
+    stride_z0,
+    stride_z1,
+    stride_u0,
+    stride_o0,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        z = tl.load(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            mask=mask_d[:, None] & mask_n[None, :],
+            other=0.,
+        )
+        u = tl.load(u_ptr + offs_d * stride_u0, mask=mask_d, other=0.)
+        acc += tl.sum(z * u[:, None], axis=0)
+    tl.store(out_ptr + offs_n * stride_o0, acc, mask=mask_n)
+
+
+@triton.jit
+def _rank1_dc_update_cols_kernel(
+    z_ptr,
+    c_ptr,
+    proj_ptr,
+    alpha,
+    beta,
+    n,
+    d,
+    stride_z0,
+    stride_z1,
+    stride_c0,
+    stride_p0,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_d = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_d = offs_d < d
+    mask_n = offs_n < n
+    z = tl.load(
+        z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+        mask=mask_d[:, None] & mask_n[None, :],
+        other=0.,
+    )
+    c = tl.load(c_ptr + offs_d * stride_c0, mask=mask_d, other=0.)
+    proj = tl.load(proj_ptr + offs_n * stride_p0, mask=mask_n, other=0.)
+    out = alpha * z - beta * c[:, None] * proj[None, :]
+    tl.store(
+        z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+        out,
+        mask=mask_d[:, None] & mask_n[None, :],
+    )
+
+
+@triton.jit
+def _rank1_dc_row_dot_kernel(
+    z_ptr,
+    r_ptr,
+    out_ptr,
+    n,
+    d,
+    stride_z0,
+    stride_z1,
+    stride_r0,
+    stride_o0,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        z = tl.load(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            mask=mask_d[:, None] & mask_n[None, :],
+            other=0.,
+        )
+        r = tl.load(r_ptr + offs_d * stride_r0, mask=mask_d, other=0.)
+        acc += tl.sum(z * r[:, None], axis=0)
+    tl.store(out_ptr + offs_n * stride_o0, acc, mask=mask_n)
+
+
+def _rank1_dc_project_cols_triton(z: torch.Tensor, u: torch.Tensor):
+    n = z.shape[1]
+    out = torch.empty(n, device=z.device, dtype=torch.float32)
+    block_n = 32
+    block_d = 32
+    grid = (triton.cdiv(n, block_n),)
+    _rank1_dc_project_cols_kernel[grid](
+        z, u, out,
+        n, z.shape[0],
+        z.stride(0), z.stride(1),
+        u.stride(0), out.stride(0),
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out.to(z.dtype)
+
+
+def _rank1_dc_update_cols_triton(z: torch.Tensor, c_vec: torch.Tensor, proj: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor):
+    n = z.shape[1]
+    block_n = 32
+    block_d = 32
+    grid = (triton.cdiv(z.shape[0], block_d), triton.cdiv(n, block_n))
+    _rank1_dc_update_cols_kernel[grid](
+        z, c_vec, proj, alpha.item(), beta.item(),
+        n, z.shape[0],
+        z.stride(0), z.stride(1),
+        c_vec.stride(0), proj.stride(0),
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def _rank1_dc_row_dot_triton(z: torch.Tensor, r: torch.Tensor):
+    n = z.shape[1]
+    out = torch.empty(n, device=z.device, dtype=torch.float32)
+    block_n = 32
+    block_d = 32
+    grid = (triton.cdiv(n, block_n),)
+    _rank1_dc_row_dot_kernel[grid](
+        z, r, out,
+        n, z.shape[0],
+        z.stride(0), z.stride(1),
+        r.stride(0), out.stride(0),
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out.to(z.dtype)
+
+
+@triton.jit
+def _rank1_dc_update_cols_fused_kernel(
+    z_ptr,
+    u_ptr,
+    c_ptr,
+    alpha,
+    beta,
+    n,
+    d,
+    stride_z0,
+    stride_z1,
+    stride_u0,
+    stride_c0,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n
+    proj = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        z = tl.load(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            mask=mask_d[:, None] & mask_n[None, :],
+            other=0.,
+        )
+        u = tl.load(u_ptr + offs_d * stride_u0, mask=mask_d, other=0.)
+        proj += tl.sum(z * u[:, None], axis=0)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        z = tl.load(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            mask=mask_d[:, None] & mask_n[None, :],
+            other=0.,
+        )
+        c = tl.load(c_ptr + offs_d * stride_c0, mask=mask_d, other=0.)
+        out = alpha * z - beta * c[:, None] * proj[None, :]
+        tl.store(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            out,
+            mask=mask_d[:, None] & mask_n[None, :],
+        )
+
+
+@triton.jit
+def _rank1_dc_update_cols_and_row_dot_fused_kernel(
+    z_ptr,
+    u_ptr,
+    c_ptr,
+    r_ptr,
+    out_ptr,
+    alpha,
+    beta,
+    n,
+    d,
+    stride_z0,
+    stride_z1,
+    stride_u0,
+    stride_c0,
+    stride_r0,
+    stride_o0,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n
+    proj = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        z = tl.load(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            mask=mask_d[:, None] & mask_n[None, :],
+            other=0.,
+        )
+        u = tl.load(u_ptr + offs_d * stride_u0, mask=mask_d, other=0.)
+        proj += tl.sum(z * u[:, None], axis=0)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for d0 in range(0, tl.cdiv(d, BLOCK_D)):
+        offs_d = d0 * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d
+        z = tl.load(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            mask=mask_d[:, None] & mask_n[None, :],
+            other=0.,
+        )
+        c = tl.load(c_ptr + offs_d * stride_c0, mask=mask_d, other=0.)
+        r = tl.load(r_ptr + offs_d * stride_r0, mask=mask_d, other=0.)
+        out = alpha * z - beta * c[:, None] * proj[None, :]
+        tl.store(
+            z_ptr + offs_d[:, None] * stride_z0 + offs_n[None, :] * stride_z1,
+            out,
+            mask=mask_d[:, None] & mask_n[None, :],
+        )
+        acc += tl.sum(out * r[:, None], axis=0)
+    tl.store(out_ptr + offs_n * stride_o0, acc, mask=mask_n)
+
+
+def _rank1_dc_update_cols_fused_triton(z: torch.Tensor, u: torch.Tensor, c_vec: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor):
+    n = z.shape[1]
+    block_n = 32
+    block_d = 32
+    grid = (triton.cdiv(n, block_n),)
+    _rank1_dc_update_cols_fused_kernel[grid](
+        z, u, c_vec, alpha.item(), beta.item(),
+        n, z.shape[0],
+        z.stride(0), z.stride(1),
+        u.stride(0), c_vec.stride(0),
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def _rank1_dc_update_cols_and_row_dot_fused_triton(z: torch.Tensor, u: torch.Tensor, c_vec: torch.Tensor, r: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor):
+    n = z.shape[1]
+    out = torch.empty(n, device=z.device, dtype=torch.float32)
+    block_n = 32
+    block_d = 32
+    grid = (triton.cdiv(n, block_n),)
+    _rank1_dc_update_cols_and_row_dot_fused_kernel[grid](
+        z, u, c_vec, r, out, alpha.item(), beta.item(),
+        n, z.shape[0],
+        z.stride(0), z.stride(1),
+        u.stride(0), c_vec.stride(0), r.stride(0), out.stride(0),
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out.to(z.dtype)
+
+
+@triton.jit
 def _rank1_dc_build_t_kernel(
     a_ptr,
     b_ptr,
@@ -577,19 +869,30 @@ def _build_rank1_dc_chunk_transfer(
             a_prefix = alpha_prefix[t] * (eye_d - a_wy[:t + 1].transpose(0, 1) @ solve_prefix)
             r_chunk[t] = torch.matmul(rs[t], a_prefix)
 
+    use_triton_cols = k_chunk.is_cuda and not torch.is_grad_enabled()
+
     l_chunk = torch.zeros(c, c, device=device, dtype=dtype)
     z_cols = torch.empty(d, c, device=device, dtype=dtype)
     for t in range(c):
         if t > 0:
-            proj = torch.matmul(u_vecs[t], z_cols[:, :t])
-            z_cols[:, :t] = alpha[t] * z_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+            if use_triton_cols:
+                l_chunk[t, :t] = _rank1_dc_update_cols_and_row_dot_fused_triton(
+                    z_cols[:, :t], u_vecs[t], c_vecs[t], rs[t], alpha[t], beta_chunk[t]
+                )
+            else:
+                proj = torch.matmul(u_vecs[t], z_cols[:, :t])
+                z_cols[:, :t] = alpha[t] * z_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+                l_chunk[t, :t] = torch.matmul(rs[t], z_cols[:, :t])
         z_cols[:, t] = p_vecs[t]
-        l_chunk[t, :t + 1] = torch.matmul(rs[t], z_cols[:, :t + 1])
+        l_chunk[t, t] = torch.dot(rs[t], p_vecs[t])
 
     p_cols = p_vecs.transpose(0, 1).contiguous()
     for t in range(c - 1, 0, -1):
-        proj = torch.matmul(u_vecs[t], p_cols[:, :t])
-        p_cols[:, :t] = alpha[t] * p_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
+        if use_triton_cols:
+            _rank1_dc_update_cols_fused_triton(p_cols[:, :t], u_vecs[t], c_vecs[t], alpha[t], beta_chunk[t])
+        else:
+            proj = torch.matmul(u_vecs[t], p_cols[:, :t])
+            p_cols[:, :t] = alpha[t] * p_cols[:, :t] - beta_chunk[t] * c_vecs[t][:, None] * proj[None, :]
     p_chunk = p_cols.transpose(0, 1).contiguous()
 
     return a_chunk, r_chunk, l_chunk, p_chunk
