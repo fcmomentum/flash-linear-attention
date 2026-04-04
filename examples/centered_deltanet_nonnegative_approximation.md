@@ -566,3 +566,481 @@ In implementation order, the sensible path is:
 3. only then build a chunked Triton kernel for the coupled \((S_t, b_t)\) recurrence
 
 This is why the current prototype is naturally a recurrent reference path rather than a drop-in chunk-kernel modification. The recurrent kernel matches the math directly; the chunked kernel requires a new derivation.
+
+## What the Proper Chunked Version Would Need
+
+A proper chunked implementation must not treat the rank-1 DC-removal term as a small patch on top of the existing chunk algebra. The correct object to chunk is the coupled recurrence
+
+$$
+\mathcal{H}_t = (S_t, b_t),
+$$
+
+with updates
+
+$$
+\hat v_t = S_{t-1} \phi(k_t) - \lambda_k(t) b_{t-1},
+$$
+$$
+\delta_t = \beta_t (v_t - \hat v_t),
+$$
+$$
+S_t = \alpha_t S_{t-1} + \delta_t \phi(k_t)^\top,
+$$
+$$
+b_t = \alpha_t b_{t-1} + \delta_t.
+$$
+
+The key point is that this can be written as a linear recurrence in an augmented state, but not in the same reduced form used by the current chunked DeltaNet kernel.
+
+### Augmented Linear View
+
+For each output channel, define the augmented state
+
+$$
+\widetilde{h}_t =
+\begin{bmatrix}
+\operatorname{vec}(S_t) \\
+b_t
+\end{bmatrix}.
+$$
+
+Then each step is an affine linear map driven by token-dependent coefficients \(\phi(k_t)\), \(\lambda_k(t)\), \(\beta_t\), and \(\alpha_t\). The important consequence is that chunk composition is still possible in principle:
+
+- each chunk induces a linear map from incoming augmented state to outgoing augmented state
+- each chunk also induces a local readout contribution for outputs inside the chunk
+
+So the right chunked formulation is a block scan over augmented states, not a reuse of the existing scalar/matrix chunk summary.
+
+### What Must Be Summarized Per Chunk
+
+For a chunk spanning timesteps \(t \in [c_0, c_1]\), a correct summary needs at least:
+
+- a matrix-to-matrix carry for how incoming \(S\) contributes to outgoing \(S\)
+- a vector-to-matrix carry for how incoming \(b\) contributes to outgoing \(S\)
+- a matrix-to-vector carry for how incoming \(S\) contributes to outgoing \(b\)
+- a vector-to-vector carry for how incoming \(b\) contributes to outgoing \(b\)
+- an inhomogeneous term coming from the values \(v_t\)
+
+In other words, the chunk transfer is block-structured:
+
+$$
+\begin{bmatrix}
+S_{\mathrm{out}} \\
+b_{\mathrm{out}}
+\end{bmatrix}
+=
+\begin{bmatrix}
+A_{SS} & A_{Sb} \\
+A_{bS} & A_{bb}
+\end{bmatrix}
+\begin{bmatrix}
+S_{\mathrm{in}} \\
+b_{\mathrm{in}}
+\end{bmatrix}
++
+\begin{bmatrix}
+c_S \\
+c_b
+\end{bmatrix}.
+$$
+
+The standard chunked DeltaNet effectively only needs the \(A_{SS}\) block plus its associated inhomogeneous term. Rank-1 DC removal requires all four blocks.
+
+### Why This Is the Matched Chunk Form
+
+The mismatch comes from the innovation term
+
+$$
+\delta_t = \beta_t \bigl(v_t - S_{t-1}\phi(k_t) + \lambda_k(t) b_{t-1}\bigr).
+$$
+
+Substituting this into the updates gives:
+
+$$
+S_t = \alpha_t S_{t-1} + \beta_t v_t \phi(k_t)^\top - \beta_t (S_{t-1}\phi(k_t)) \phi(k_t)^\top + \beta_t \lambda_k(t) b_{t-1} \phi(k_t)^\top,
+$$
+
+$$
+b_t = \alpha_t b_{t-1} + \beta_t v_t - \beta_t S_{t-1}\phi(k_t) + \beta_t \lambda_k(t) b_{t-1}.
+$$
+
+This makes the coupling explicit:
+
+- incoming \(S\) affects outgoing \(S\)
+- incoming \(b\) affects outgoing \(S\)
+- incoming \(S\) affects outgoing \(b\)
+- incoming \(b\) affects outgoing \(b\)
+
+That is exactly the block transfer structure above.
+
+### Practical Chunk Construction
+
+A practical chunk kernel would therefore proceed in three stages.
+
+1. Intra-chunk local solve
+
+Compute all purely local terms within the chunk, including the local outputs and the inhomogeneous contribution \((c_S, c_b)\).
+
+2. Chunk transfer extraction
+
+Build the block transfer operator
+
+$$
+T_c =
+\begin{bmatrix}
+A_{SS}^{(c)} & A_{Sb}^{(c)} \\
+A_{bS}^{(c)} & A_{bb}^{(c)}
+\end{bmatrix}
+$$
+
+for each chunk.
+
+3. Inter-chunk scan
+
+Perform a prefix scan over chunk transfers, composing them exactly as affine block maps, then feed the resulting incoming state into each chunk's local solve.
+
+This is the proper chunked analogue of the recurrent implementation.
+
+### What Should Stay Low-Rank
+
+Even though the full transfer is block-structured, the new coupling introduced by DC removal is still low-rank in the feature space.
+
+In particular:
+
+- the extra state \(b_t\) is only a \(V\)-vector
+- the coupling from \(b\) into \(S\) always appears through \(\phi(k_t)^\top\)
+- the coupling from \(S\) into \(b\) always appears through \(\phi(k_t)\)
+
+So a good chunk derivation should exploit that low-rank structure rather than materializing a dense augmented operator.
+
+### The Right Engineering Goal
+
+So the proper chunked version is not:
+
+- "reuse the current chunk kernel and add one extra subtraction"
+
+It is:
+
+- "derive the chunk transfer operator for the augmented low-rank recurrence and implement that operator efficiently"
+
+That is the mathematically matched chunked version of rank-1 DC removal.
+
+## Actual Chunked Derivation for the Augmented Recurrence
+
+This section writes the rank-1 DC-removal recurrence in a form that can actually be chunked.
+
+We start from
+
+$$
+\hat v_t = S_{t-1} \phi_t - \lambda_t b_{t-1},
+$$
+$$
+\delta_t = \beta_t (v_t - \hat v_t),
+$$
+$$
+S_t = \alpha_t S_{t-1} + \delta_t \phi_t^\top,
+$$
+$$
+b_t = \alpha_t b_{t-1} + \delta_t,
+$$
+
+where for brevity we write
+
+$$
+\phi_t := \phi(k_t),
+\qquad
+\lambda_t := \lambda_k(t).
+$$
+
+## 1. Expand the Coupling Explicitly
+
+Substitute the innovation into the two state updates:
+
+$$
+S_t
+= \alpha_t S_{t-1}
++ \beta_t v_t \phi_t^\top
+- \beta_t (S_{t-1}\phi_t) \phi_t^\top
++ \beta_t \lambda_t b_{t-1} \phi_t^\top,
+$$
+
+$$
+b_t
+= \alpha_t b_{t-1}
++ \beta_t v_t
+- \beta_t S_{t-1}\phi_t
++ \beta_t \lambda_t b_{t-1}.
+$$
+
+So the incoming pair \((S_{t-1}, b_{t-1})\) is mapped to \((S_t, b_t)\) by a linear operator plus an inhomogeneous term from \(v_t\).
+
+## 2. Per-Step Block Operator
+
+Define the per-step linear map
+
+$$
+\mathcal{T}_t:
+\begin{bmatrix}
+S \\
+b
+\end{bmatrix}
+\mapsto
+\begin{bmatrix}
+\alpha_t S - \beta_t (S\phi_t) \phi_t^\top + \beta_t \lambda_t b \phi_t^\top \\
+\alpha_t b - \beta_t S\phi_t + \beta_t \lambda_t b
+\end{bmatrix}.
+$$
+
+Define also the value-driven inhomogeneous term
+
+$$
+\mathcal{c}_t(v_t)
+=
+\begin{bmatrix}
+\beta_t v_t \phi_t^\top \\
+\beta_t v_t
+\end{bmatrix}.
+$$
+
+Then the recurrence is exactly
+
+$$
+\begin{bmatrix}
+S_t \\
+b_t
+\end{bmatrix}
+=
+\mathcal{T}_t
+\begin{bmatrix}
+S_{t-1} \\
+b_{t-1}
+\end{bmatrix}
++
+\mathcal{c}_t(v_t).
+$$
+
+This is the object that must be chunked.
+
+## 3. Matrix-Friendly Decomposition of the Step Operator
+
+It is useful to separate the action on \(S\) and \(b\).
+
+For any incoming \((S,b)\),
+
+$$
+S' = \mathcal{T}^{SS}_t(S) + \mathcal{T}^{Sb}_t(b),
+$$
+$$
+b' = \mathcal{T}^{bS}_t(S) + \mathcal{T}^{bb}_t(b),
+$$
+
+with
+
+$$
+\mathcal{T}^{SS}_t(S) = \alpha_t S - \beta_t (S\phi_t) \phi_t^\top,
+$$
+$$
+\mathcal{T}^{Sb}_t(b) = \beta_t \lambda_t b \phi_t^\top,
+$$
+$$
+\mathcal{T}^{bS}_t(S) = -\beta_t S\phi_t,
+$$
+$$
+\mathcal{T}^{bb}_t(b) = (\alpha_t + \beta_t \lambda_t) b.
+$$
+
+So the step operator already has the four-block structure
+
+$$
+\mathcal{T}_t =
+\begin{bmatrix}
+\mathcal{T}^{SS}_t & \mathcal{T}^{Sb}_t \\
+\mathcal{T}^{bS}_t & \mathcal{T}^{bb}_t
+\end{bmatrix}.
+$$
+
+## 4. Chunk Transfer as a Product of Step Operators
+
+Consider a chunk with local indices \(j = 1, \dots, C\). Let the incoming state be \((S_0, b_0)\), and let \((S_j, b_j)\) denote the state after local step \(j\).
+
+Then
+
+$$
+\begin{bmatrix}
+S_C \\
+b_C
+\end{bmatrix}
+=
+\mathcal{T}_C \mathcal{T}_{C-1} \cdots \mathcal{T}_1
+\begin{bmatrix}
+S_0 \\
+b_0
+\end{bmatrix}
++
+\sum_{m=1}^C
+\left(
+\mathcal{T}_C \mathcal{T}_{C-1} \cdots \mathcal{T}_{m+1}
+\right)
+\mathcal{c}_m(v_m).
+$$
+
+This is the exact chunk summary. So for each chunk we need:
+
+$$
+\mathcal{A}_{\mathrm{chunk}} := \mathcal{T}_C \mathcal{T}_{C-1} \cdots \mathcal{T}_1,
+$$
+$$
+\mathcal{c}_{\mathrm{chunk}} :=
+\sum_{m=1}^C
+\left(
+\mathcal{T}_C \mathcal{T}_{C-1} \cdots \mathcal{T}_{m+1}
+\right)
+\mathcal{c}_m(v_m).
+$$
+
+Then the chunk output state is
+
+$$
+\begin{bmatrix}
+S_{\mathrm{out}} \\
+b_{\mathrm{out}}
+\end{bmatrix}
+=
+\mathcal{A}_{\mathrm{chunk}}
+\begin{bmatrix}
+S_{\mathrm{in}} \\
+b_{\mathrm{in}}
+\end{bmatrix}
++
+\mathcal{c}_{\mathrm{chunk}}.
+$$
+
+## 5. Block Form of the Chunk Transfer
+
+Write the chunk transfer in blocks:
+
+$$
+\mathcal{A}_{\mathrm{chunk}} =
+\begin{bmatrix}
+A_{SS} & A_{Sb} \\
+A_{bS} & A_{bb}
+\end{bmatrix},
+$$
+$$
+\mathcal{c}_{\mathrm{chunk}} =
+\begin{bmatrix}
+c_S \\
+c_b
+\end{bmatrix}.
+$$
+
+Then
+
+$$
+S_{\mathrm{out}} = A_{SS}(S_{\mathrm{in}}) + A_{Sb}(b_{\mathrm{in}}) + c_S,
+$$
+$$
+b_{\mathrm{out}} = A_{bS}(S_{\mathrm{in}}) + A_{bb}(b_{\mathrm{in}}) + c_b.
+$$
+
+This is the precise meaning of the four-block summary described earlier.
+
+## 6. Composition Rule Across Chunks
+
+Suppose chunk 1 has transfer \((\mathcal{A}_1, \mathcal{c}_1)\) and chunk 2 has transfer \((\mathcal{A}_2, \mathcal{c}_2)\). Then their composition is
+
+$$
+(\mathcal{A}_2, \mathcal{c}_2) \circ (\mathcal{A}_1, \mathcal{c}_1)
+=
+(\mathcal{A}_2 \mathcal{A}_1,\; \mathcal{A}_2 \mathcal{c}_1 + \mathcal{c}_2).
+$$
+
+This is the associative law needed for a chunk-level scan.
+
+So the correct inter-chunk scan is not over the original DeltaNet summaries, but over affine block operators of this form.
+
+## 7. Local Readout Inside a Chunk
+
+For a token inside the chunk, the output is
+
+$$
+y_t = S_t \psi_t - \lambda_q(t) b_t,
+$$
+
+where
+
+$$
+\psi_t := \phi(q_t)
+$$
+
+or the scaled version used by the implementation.
+
+Inside a chunk, we can decompose the output into:
+
+- a contribution from the incoming chunk state \((S_{\mathrm{in}}, b_{\mathrm{in}})\)
+- a purely local contribution from values inside the chunk
+
+That is,
+
+$$
+y_t = R_t
+\begin{bmatrix}
+S_{\mathrm{in}} \\
+b_{\mathrm{in}}
+\end{bmatrix}
++ d_t,
+$$
+
+for some token-local readout operator \(R_t\) and token-local inhomogeneous term \(d_t\).
+
+This is exactly analogous to the usual chunked DeltaNet decomposition, except that the readout now depends on the augmented state.
+
+## 8. Where the Existing Chunk Derivation Stops Matching
+
+The current chunked DeltaNet derivation exploits the fact that the only state is the matrix \(S_t\), and both prediction and write couple through the same feature vector \(\phi_t\).
+
+Rank-1 DC removal destroys that simplification because:
+
+$$
+\text{prediction uses } (S_{t-1}, b_{t-1}) \text{ through } (\phi_t, \lambda_t),
+$$
+
+while
+
+$$
+\text{writing uses } \delta_t \text{ into } (S_t, b_t) \text{ through } (\phi_t, 1).
+$$
+
+So the write and read coefficients are no longer matched by a single feature map. That is why a new chunk derivation is required.
+
+## 9. The Low-Rank Opportunity
+
+Even though the augmented transfer is larger, the new terms are still structured.
+
+Specifically:
+
+$$
+\mathcal{T}^{Sb}_t(b) = \beta_t \lambda_t b \phi_t^\top
+$$
+
+is rank-1 in feature space, and
+
+$$
+\mathcal{T}^{bS}_t(S) = -\beta_t S\phi_t
+$$
+
+depends on \(S\) only through the projection \(S\phi_t\).
+
+So a good chunk implementation should never materialize the full dense block operator. It should instead propagate only the low-rank factors required to apply these blocks.
+
+## 10. Engineering Interpretation
+
+A proper chunked kernel therefore needs three derived objects per chunk:
+
+1. the standard feature-space carry used by the original DeltaNet chunk kernel
+2. an additional bias-state carry for \(b\)
+3. the cross-coupling summaries that map incoming \(S\) into outgoing \(b\), and incoming \(b\) into outgoing \(S\)
+
+Once these are derived, the inter-chunk scan is well-defined and associative.
+
+That is the actual derivation target for a mathematically correct chunked rank-1 DC-removal kernel.

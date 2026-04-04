@@ -15,6 +15,7 @@ from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, 
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
+    chunk_gated_delta_rule_rank1_dc,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_rank1_dc,
     naive_recurrent_gated_delta_rule_rank1_dc,
@@ -303,6 +304,20 @@ class GatedDeltaNet(nn.Module):
                     output_final_state=use_cache,
                     cu_seqlens=cu_seqlens,
                     use_qk_l2norm_in_kernel=False,
+                )
+            elif mode == 'chunk':
+                o, recurrent_state = chunk_gated_delta_rule_rank1_dc(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    lambda_q=lambda_q,
+                    lambda_k=lambda_k,
+                    scale=self.head_k_dim ** -0.5,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
                 )
             else:
                 o, recurrent_state = naive_recurrent_gated_delta_rule_rank1_dc(
