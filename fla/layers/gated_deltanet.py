@@ -288,6 +288,7 @@ class GatedDeltaNet(nn.Module):
             nu = nu / nu.norm(dim=-1, keepdim=True).clamp_min(self.dc_removal_eps)
             nu_sq = nu.square().sum(-1).clamp_min(self.dc_removal_eps)
             lambda_k = (k * nu.unsqueeze(0).unsqueeze(0)).sum(-1) / nu_sq.unsqueeze(0).unsqueeze(0)
+            # Pre-scale q here so the readout scale applies uniformly to both S @ q and the rank-1 bias correction.
             q_scaled = q * (self.head_k_dim ** -0.5)
             lambda_q = (q_scaled * nu.unsqueeze(0).unsqueeze(0)).sum(-1) / nu_sq.unsqueeze(0).unsqueeze(0)
             if mode == 'fused_recurrent':

@@ -364,8 +364,6 @@ def chunk_gated_delta_rule(
 
     Examples::
         >>> import torch
-import triton
-import triton.language as tl
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
         >>> from fla.ops.gated_delta_rule import chunk_gated_delta_rule
