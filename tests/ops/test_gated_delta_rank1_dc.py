@@ -12,6 +12,18 @@ from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule_rank
 from fla.utils import assert_close, device
 
 
+def _clone_inputs(inputs):
+    cloned = {}
+    for k, v in inputs.items():
+        if torch.is_tensor(v):
+            cloned[k] = v.clone()
+        elif isinstance(v, tuple):
+            cloned[k] = tuple(x.clone() if torch.is_tensor(x) else x for x in v)
+        else:
+            cloned[k] = v
+    return cloned
+
+
 def _make_rank1_dc_inputs(
     batch_size: int,
     seq_len: int,
@@ -68,11 +80,11 @@ def test_rank1_dc_fused_recurrent_matches_naive(
     dtype: torch.dtype,
 ):
     inputs = _make_rank1_dc_inputs(B, T, H, K, V, dtype)
-    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **inputs)
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **_clone_inputs(inputs))
     tri_o, tri_state = fused_recurrent_gated_delta_rule_rank1_dc(
         output_final_state=True,
         use_qk_l2norm_in_kernel=False,
-        **inputs,
+        **_clone_inputs(inputs),
     )
     ref_h, ref_b = ref_state
     tri_h, tri_b = tri_state
@@ -97,11 +109,11 @@ def test_rank1_dc_chunk_exact_chunk_size_1_matches_naive(
     dtype: torch.dtype,
 ):
     inputs = _make_rank1_dc_inputs(B, T, H, K, V, dtype)
-    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **inputs)
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **_clone_inputs(inputs))
     tri_o, tri_state = chunk_gated_delta_rule_rank1_dc(
         output_final_state=True,
         chunk_size=1,
-        **inputs,
+        **_clone_inputs(inputs),
     )
     ref_h, ref_b = ref_state
     tri_h, tri_b = tri_state
@@ -125,12 +137,12 @@ def test_rank1_dc_chunk_triton_matches_naive(
     dtype: torch.dtype,
 ):
     inputs = _make_rank1_dc_inputs(B, T, H, K, V, dtype)
-    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **inputs)
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **_clone_inputs(inputs))
     with torch.no_grad():
         tri_o, tri_state = chunk_gated_delta_rule_rank1_dc(
             output_final_state=True,
             chunk_size=64,
-            **inputs,
+            **_clone_inputs(inputs),
         )
     ref_h, ref_b = ref_state
     tri_h, tri_b = tri_state
@@ -154,11 +166,11 @@ def test_rank1_dc_chunk_exact_chunk64_reasonable_error(
     dtype: torch.dtype,
 ):
     inputs = _make_rank1_dc_inputs(B, T, H, K, V, dtype)
-    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **inputs)
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **_clone_inputs(inputs))
     tri_o, tri_state = chunk_gated_delta_rule_rank1_dc(
         output_final_state=True,
         chunk_size=64,
-        **inputs,
+        **_clone_inputs(inputs),
     )
     ref_h, ref_b = ref_state
     tri_h, tri_b = tri_state
