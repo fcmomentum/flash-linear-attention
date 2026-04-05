@@ -24,6 +24,39 @@ def _clone_inputs(inputs):
     return cloned
 
 
+def _make_rank1_dc_inputs_requires_grad(
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    dtype: torch.dtype,
+):
+    inputs = _make_rank1_dc_inputs(batch_size, seq_len, num_heads, head_k_dim, head_v_dim, dtype)
+    grad_inputs = {}
+    for k, v in inputs.items():
+        if k == 'initial_state':
+            state0, bias0 = v
+            grad_inputs[k] = (state0.clone().requires_grad_(True), bias0.clone().requires_grad_(True))
+        elif torch.is_tensor(v):
+            grad_inputs[k] = v.clone().requires_grad_(True)
+        else:
+            grad_inputs[k] = v
+    return grad_inputs
+
+
+def _collect_grads(named_inputs):
+    grads = {}
+    for k, v in named_inputs.items():
+        if k == 'initial_state':
+            state0, bias0 = v
+            grads['state0'] = state0.grad.clone()
+            grads['bias0'] = bias0.grad.clone()
+        elif torch.is_tensor(v) and v.grad is not None:
+            grads[k] = v.grad.clone()
+    return grads
+
+
 def _make_rank1_dc_inputs(
     batch_size: int,
     seq_len: int,
@@ -177,3 +210,76 @@ def test_rank1_dc_chunk_exact_chunk64_reasonable_error(
     assert_close('o', ref_o, tri_o, 0.03)
     assert_close('ht', ref_h, tri_h, 0.08)
     assert_close('bt', ref_b, tri_b, 0.03)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'K', 'V', 'dtype'),
+    [
+        (1, 64, 2, 32, 32, torch.float32),
+    ],
+)
+def test_rank1_dc_chunk_exact_backward_chunk1_matches_naive(
+    B: int,
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    ref_inputs = _make_rank1_dc_inputs_requires_grad(B, T, H, K, V, dtype)
+    tri_inputs = _make_rank1_dc_inputs_requires_grad(B, T, H, K, V, dtype)
+
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(
+        output_final_state=True,
+        **ref_inputs,
+    )
+    tri_o, tri_state = chunk_gated_delta_rule_rank1_dc(
+        output_final_state=True,
+        chunk_size=1,
+        **tri_inputs,
+    )
+
+    do = torch.randn_like(ref_o)
+    dht = torch.randn_like(ref_state[0])
+    dbt = torch.randn_like(ref_state[1])
+
+    ((ref_o * do).sum() + (ref_state[0] * dht).sum() + (ref_state[1] * dbt).sum()).backward()
+    ((tri_o * do).sum() + (tri_state[0] * dht).sum() + (tri_state[1] * dbt).sum()).backward()
+
+    ref_grads = _collect_grads(ref_inputs)
+    tri_grads = _collect_grads(tri_inputs)
+    for name, tol in [
+        ('q', 0.003),
+        ('k', 0.003),
+        ('v', 0.003),
+        ('beta', 0.003),
+        ('g', 0.003),
+        ('lambda_q', 0.003),
+        ('lambda_k', 0.003),
+        ('state0', 0.003),
+        ('bias0', 0.003),
+    ]:
+        assert_close(name, ref_grads[name], tri_grads[name], tol)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'K', 'V', 'dtype'),
+    [
+        (1, 32, 2, 32, 32, torch.float32),
+    ],
+)
+def test_rank1_dc_fused_recurrent_backward_not_implemented(
+    B: int,
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    inputs = _make_rank1_dc_inputs_requires_grad(B, T, H, K, V, dtype)
+    with pytest.raises(NotImplementedError):
+        fused_recurrent_gated_delta_rule_rank1_dc(
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+            **inputs,
+        )

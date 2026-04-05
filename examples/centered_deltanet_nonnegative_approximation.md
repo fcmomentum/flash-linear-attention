@@ -1505,3 +1505,249 @@ What remains is not more recurrence algebra. What remains is kernel design:
 - how to map that computation onto Triton tiles efficiently
 
 That is the final bridge from the exact math to the fully optimized chunk kernel.
+
+## Backward Design for the Augmented Rank-1 DC Recurrence
+
+For training, the right backward target is the exact chunk recurrence, not the fused recurrent inference kernel.
+
+Write the augmented state as
+
+$$
+X_t =
+\begin{bmatrix}
+S_t \\
+ b_t
+\end{bmatrix}
+\in \mathbb{R}^{(K+1) \times V}.
+$$
+
+Using
+
+$$
+u_t =
+\begin{bmatrix}
+\phi(k_t) \\
+1
+\end{bmatrix},
+\qquad
+c_t =
+\begin{bmatrix}
+\phi(k_t) \\
+-\lambda_k(t)
+\end{bmatrix},
+\qquad
+r_t =
+\begin{bmatrix}
+\phi(q_t) \cdot \mathrm{scale} \\
+-\lambda_q(t)
+\end{bmatrix},
+$$
+
+the validated forward recurrence is
+
+$$
+X_t = \alpha_t \left(I - \beta_t \nu_t c_t^\top\right) X_{t-1} + \beta_t \, \nu_t v_t^\top,
+$$
+
+with readout
+
+$$
+y_t = r_t^\top X_t.
+$$
+
+### Reverse-Time Adjoint State
+
+Define the adjoint state
+
+$$
+G_t := \frac{\partial L}{\partial X_t} \in \mathbb{R}^{(K+1) \times V}.
+$$
+
+For each timestep, the output contributes
+
+$$
+G_t \mathrel{+}= r_t \, d y_t^\top.
+$$
+
+This is the augmented version of adding the query/readout contribution back into the hidden-state gradient.
+
+### Useful Forward Intermediates
+
+For the reverse update, define
+
+$$
+m_t := c_t^\top X_{t-1} \in \mathbb{R}^{1 \times V},
+$$
+
+so that
+
+$$
+X_t = \alpha_t \left(X_{t-1} - \beta_t \, \nu_t m_t\right) + \beta_t \, \nu_t v_t^\top.
+$$
+
+Also define the projected adjoint
+
+$$
+n_t := G_t^\top \nu_t \in \mathbb{R}^{V}.
+$$
+
+### Gradient with Respect to the Previous State
+
+The reverse recurrence for the state is
+
+$$
+G_{t-1} = \alpha_t \left(I - \beta_t c_t \nu_t^\top\right) G_t.
+$$
+
+This is the exact adjoint of the forward map
+
+$$
+X_{t-1} \mapsto \alpha_t \left(I - \beta_t \nu_t c_t^\top\right) X_{t-1}.
+$$
+
+### Local Parameter Gradients
+
+The write term gives
+
+$$
+d v_t = \beta_t \, G_t^\top \nu_t = \beta_t n_t,
+$$
+
+$$
+d \nu_t^{(\mathrm{write})} = \beta_t \, G_t v_t,
+$$
+
+$$
+d \beta_t^{(\mathrm{write})} = \langle G_t, \nu_t v_t^\top \rangle.
+$$
+
+The multiplicative state term gives
+
+$$
+d \nu_t^{(\mathrm{state})} = -\alpha_t \beta_t \, G_t m_t^\top,
+$$
+
+$$
+d c_t = -\alpha_t \beta_t \, X_{t-1} \left(\nu_t^\top G_t\right),
+$$
+
+$$
+d \beta_t^{(\mathrm{state})} = -\alpha_t \, \langle G_t, \nu_t m_t \rangle,
+$$
+
+$$
+d \alpha_t = \left\langle G_t, X_{t-1} - \beta_t \, \nu_t m_t \right\rangle.
+$$
+
+So the total local gradients are
+
+$$
+d \nu_t = d \nu_t^{(\mathrm{write})} + d \nu_t^{(\mathrm{state})},
+$$
+
+$$
+d \beta_t = d \beta_t^{(\mathrm{write})} + d \beta_t^{(\mathrm{state})}.
+$$
+
+### Unpacking the Augmented Vectors
+
+Because
+
+$$
+\nu_t =
+\begin{bmatrix}
+\phi(k_t) \\
+1
+\end{bmatrix},
+\qquad
+c_t =
+\begin{bmatrix}
+\phi(k_t) \\
+-\lambda_k(t)
+\end{bmatrix},
+\qquad
+r_t =
+\begin{bmatrix}
+\phi(q_t) \cdot \mathrm{scale} \\
+-\lambda_q(t)
+\end{bmatrix},
+$$
+
+the physical gradients are recovered as follows.
+
+From $$d \nu_t$$:
+
+- the first $$K$$ coordinates contribute to $$d k_t$$,
+- the last coordinate is ignored because the appended constant $$1$$ is not learned.
+
+From $$d c_t$$:
+
+- the first $$K$$ coordinates add another contribution to $$d k_t$$,
+- the last coordinate gives
+
+$$
+d \lambda_k(t) = - d c_t[K].
+$$
+
+From the readout vector gradient $$d r_t$$:
+
+- the first $$K$$ coordinates give
+
+$$
+d q_t = \mathrm{scale} \cdot d r_t[:K],
+$$
+
+- the last coordinate gives
+
+$$
+d \lambda_q(t) = - d r_t[K].
+$$
+
+Finally, with
+
+$$
+\alpha_t = \exp(g_t),
+$$
+
+we have
+
+$$
+d g_t = d \alpha_t \cdot \alpha_t.
+$$
+
+### Practical Implementation Order
+
+The right implementation sequence is:
+
+1. Add a pure PyTorch backward reference for the exact augmented chunk recurrence.
+2. Validate all gradients against the naive recurrent rule.
+3. Only after that, derive a compressed backward for the chunk summaries.
+4. Treat fused recurrent backward as optional, since training already routes through chunk mode.
+
+### What to Save from Forward
+
+A minimal exact backward implementation should save either:
+
+- the full sequence of $$X_{t-1}$$ states, or
+- enough per-step intermediates such as $$m_t = c_t^\top X_{t-1}$$ together with the forward states needed to reconstruct the reverse scan.
+
+For a correctness-first reference implementation, saving the per-step augmented states is the simplest option.
+
+### Recommended Gradient Tests
+
+The backward reference should be checked against the naive recurrent implementation for gradients of:
+
+- $$q$$
+- $$k$$
+- $$v$$
+- $$g$$
+- $$\beta$$
+- $$\lambda_q$$
+- $$\lambda_k$$
+- the initial matrix state $$S_0$$
+- the initial bias state $$b_0$$
+
+The most informative test settings are:
+
+- `chunk_size = 1`, which should match the recurrent reference nearly exactly,
+- moderate chunk sizes such as `32` or `64`, which test the true chunked backward path.
