@@ -938,13 +938,13 @@ def _chunk_rank1_dc_single_sequence(
     state: torch.Tensor,
     bias_state: torch.Tensor,
 ):
-    h = state.clone()
-    b = bias_state.clone()
+    h_list = [state[head_idx].clone() for head_idx in range(state.shape[0])]
+    b_list = [bias_state[head_idx].clone() for head_idx in range(bias_state.shape[0])]
     num_heads, seq_len, k_dim = q.shape
     v_dim = v.shape[-1]
-    o = torch.zeros(num_heads, seq_len, v_dim, device=v.device, dtype=torch.float32)
+    o_chunks = [[None for _ in range((seq_len + chunk_size - 1) // chunk_size)] for _ in range(num_heads)]
 
-    for start in range(0, seq_len, chunk_size):
+    for chunk_idx, start in enumerate(range(0, seq_len, chunk_size)):
         end = min(start + chunk_size, seq_len)
         for head_idx in range(num_heads):
             a_chunk, r_chunk, l_chunk, p_chunk = _build_rank1_dc_chunk_transfer(
@@ -957,14 +957,18 @@ def _chunk_rank1_dc_single_sequence(
                 scale=scale,
             )
 
-            x_in = torch.cat([h[head_idx], b[head_idx].unsqueeze(0)], dim=0)
+            x_in = torch.cat([h_list[head_idx], b_list[head_idx].unsqueeze(0)], dim=0)
             v_chunk = v[head_idx, start:end]
             x_out = a_chunk @ x_in + p_chunk.transpose(0, 1) @ v_chunk
             y_chunk = r_chunk @ x_in + l_chunk @ v_chunk
 
-            h[head_idx] = x_out[:k_dim]
-            b[head_idx] = x_out[k_dim]
-            o[head_idx, start:end] = y_chunk
+            h_list[head_idx] = x_out[:k_dim]
+            b_list[head_idx] = x_out[k_dim]
+            o_chunks[head_idx][chunk_idx] = y_chunk
+
+    o = torch.stack([torch.cat(chunks, dim=0) for chunks in o_chunks], dim=0)
+    h = torch.stack(h_list, dim=0)
+    b = torch.stack(b_list, dim=0)
     return o, h, b
 
 

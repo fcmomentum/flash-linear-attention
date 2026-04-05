@@ -163,13 +163,15 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
             raise ValueError("Expected batch size 1 when `cu_seqlens` is provided.")
         total = q.shape[1]
         H, K, V = q.shape[2], q.shape[3], v.shape[-1]
-        o = torch.zeros(1, total, H, V, device=v.device, dtype=torch.float32)
         num_seq = len(cu_seqlens) - 1
-        h = torch.zeros(num_seq, H, K, V, device=v.device, dtype=torch.float32)
-        b = torch.zeros(num_seq, H, V, device=v.device, dtype=torch.float32)
+        init_h = torch.zeros(num_seq, H, K, V, device=v.device, dtype=torch.float32)
+        init_b = torch.zeros(num_seq, H, V, device=v.device, dtype=torch.float32)
         if initial_state is not None:
-            h = initial_state[0].to(torch.float32).clone()
-            b = initial_state[1].to(torch.float32).clone()
+            init_h = initial_state[0].to(torch.float32).clone()
+            init_b = initial_state[1].to(torch.float32).clone()
+        o_segments = []
+        h_segments = []
+        b_segments = []
         for n in range(num_seq):
             bos = int(cu_seqlens[n].item())
             eos = int(cu_seqlens[n + 1].item())
@@ -180,7 +182,7 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
             g_n = g[0, bos:eos].transpose(0, 1).contiguous()
             lambda_q_n = lambda_q[0, bos:eos].transpose(0, 1).contiguous()
             lambda_k_n = lambda_k[0, bos:eos].transpose(0, 1).contiguous()
-            o_n, h[n], b[n] = _run_rank1_dc_single_sequence(
+            o_n, h_n, b_n = _run_rank1_dc_single_sequence(
                 q=q_n,
                 k=k_n,
                 v=v_n,
@@ -189,24 +191,36 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
                 lambda_q=lambda_q_n,
                 lambda_k=lambda_k_n,
                 scale=scale,
-                h=h[n],
-                b=b[n],
+                h=init_h[n],
+                b=init_b[n],
             )
-            o[0, bos:eos] = o_n.transpose(0, 1)
+            o_segments.append(o_n.transpose(0, 1))
+            h_segments.append(h_n)
+            b_segments.append(b_n)
+        o = torch.zeros(1, total, H, V, device=v.device, dtype=torch.float32)
+        for n in range(num_seq):
+            bos = int(cu_seqlens[n].item())
+            eos = int(cu_seqlens[n + 1].item())
+            o = o.clone()
+            o[0, bos:eos] = o_segments[n]
+        h = torch.stack(h_segments, dim=0)
+        b = torch.stack(b_segments, dim=0)
     else:
         q, k, v, beta, g, lambda_q, lambda_k = map(
             lambda x: x.transpose(1, 2).contiguous(),
             [q, k, v, beta, g, lambda_q, lambda_k],
         )
         B, H, T, K, V = *k.shape, v.shape[-1]
-        o = torch.zeros(B, H, T, V, device=v.device, dtype=torch.float32)
-        h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
-        b = torch.zeros(B, H, V, device=v.device, dtype=torch.float32)
+        init_h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
+        init_b = torch.zeros(B, H, V, device=v.device, dtype=torch.float32)
         if initial_state is not None:
-            h = initial_state[0].to(torch.float32).clone()
-            b = initial_state[1].to(torch.float32).clone()
+            init_h = initial_state[0].to(torch.float32).clone()
+            init_b = initial_state[1].to(torch.float32).clone()
+        o_list = []
+        h_list = []
+        b_list = []
         for batch_idx in range(B):
-            o[batch_idx], h[batch_idx], b[batch_idx] = _run_rank1_dc_single_sequence(
+            o_i, h_i, b_i = _run_rank1_dc_single_sequence(
                 q=q[batch_idx],
                 k=k[batch_idx],
                 v=v[batch_idx],
@@ -215,10 +229,15 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
                 lambda_q=lambda_q[batch_idx],
                 lambda_k=lambda_k[batch_idx],
                 scale=scale,
-                h=h[batch_idx],
-                b=b[batch_idx],
+                h=init_h[batch_idx],
+                b=init_b[batch_idx],
             )
-        o = o.transpose(1, 2).contiguous()
+            o_list.append(o_i)
+            h_list.append(h_i)
+            b_list.append(b_i)
+        o = torch.stack(o_list, dim=0).transpose(1, 2).contiguous()
+        h = torch.stack(h_list, dim=0)
+        b = torch.stack(b_list, dim=0)
 
     if not output_final_state:
         return o.to(orig_dtype), None
