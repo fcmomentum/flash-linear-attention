@@ -972,8 +972,7 @@ def _chunk_rank1_dc_single_sequence(
     return o, h, b
 
 
-@torch.compiler.disable
-def chunk_gated_delta_rule_rank1_dc(
+def _chunk_gated_delta_rule_rank1_dc_reference(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -981,43 +980,15 @@ def chunk_gated_delta_rule_rank1_dc(
     beta: torch.Tensor,
     lambda_q: torch.Tensor,
     lambda_k: torch.Tensor,
-    scale: float = None,
-    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
-    output_final_state: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 64,
-    **kwargs,
+    scale: float,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None,
+    cu_seqlens: torch.LongTensor | None,
+    chunk_size: int,
 ):
-    orig_dtype = v.dtype
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
-
-    use_triton_chunk_local = (
-        cu_seqlens is None
-        and q.is_cuda
-        and (not torch.is_grad_enabled())
-        and not any(x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k))
-    )
-
     q, k, v, g, beta, lambda_q, lambda_k = map(
         lambda x: x.to(torch.float32),
         [q, k, v, g, beta, lambda_q, lambda_k],
     )
-
-    if use_triton_chunk_local:
-        return _chunk_rank1_dc_triton_local(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            lambda_q=lambda_q,
-            lambda_k=lambda_k,
-            scale=scale,
-            chunk_size=chunk_size,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-        )
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -1063,41 +1034,204 @@ def chunk_gated_delta_rule_rank1_dc(
             o[0, bos:eos] = o_n
         state = torch.stack(state_segments, dim=0)
         bias_state = torch.stack(bias_segments, dim=0)
-    else:
-        q, k, v, g, beta, lambda_q, lambda_k = map(
-            lambda x: x.transpose(1, 2).contiguous(),
-            [q, k, v, g, beta, lambda_q, lambda_k],
+        return o, state, bias_state
+
+    q, k, v, g, beta, lambda_q, lambda_k = map(
+        lambda x: x.transpose(1, 2).contiguous(),
+        [q, k, v, g, beta, lambda_q, lambda_k],
+    )
+    batch_size, num_heads, seq_len, k_dim, v_dim = *k.shape, v.shape[-1]
+    init_state = torch.zeros(batch_size, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
+    init_bias_state = torch.zeros(batch_size, num_heads, v_dim, device=v.device, dtype=torch.float32)
+    if initial_state is not None:
+        init_state, init_bias_state = initial_state
+        init_state = init_state.to(torch.float32).clone()
+        init_bias_state = init_bias_state.to(torch.float32).clone()
+    o_list = []
+    state_list = []
+    bias_state_list = []
+    for batch_idx in range(batch_size):
+        o_i, state_i, bias_state_i = _chunk_rank1_dc_single_sequence(
+            q=q[batch_idx],
+            k=k[batch_idx],
+            v=v[batch_idx],
+            g=g[batch_idx],
+            beta=beta[batch_idx],
+            lambda_q=lambda_q[batch_idx],
+            lambda_k=lambda_k[batch_idx],
+            scale=scale,
+            chunk_size=chunk_size,
+            state=init_state[batch_idx],
+            bias_state=init_bias_state[batch_idx],
         )
-        batch_size, num_heads, seq_len, k_dim, v_dim = *k.shape, v.shape[-1]
-        init_state = torch.zeros(batch_size, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
-        init_bias_state = torch.zeros(batch_size, num_heads, v_dim, device=v.device, dtype=torch.float32)
-        if initial_state is not None:
-            init_state, init_bias_state = initial_state
-            init_state = init_state.to(torch.float32).clone()
-            init_bias_state = init_bias_state.to(torch.float32).clone()
-        o_list = []
-        state_list = []
-        bias_state_list = []
-        for batch_idx in range(batch_size):
-            o_i, state_i, bias_state_i = _chunk_rank1_dc_single_sequence(
-                q=q[batch_idx],
-                k=k[batch_idx],
-                v=v[batch_idx],
-                g=g[batch_idx],
-                beta=beta[batch_idx],
-                lambda_q=lambda_q[batch_idx],
-                lambda_k=lambda_k[batch_idx],
+        o_list.append(o_i)
+        state_list.append(state_i)
+        bias_state_list.append(bias_state_i)
+    o = torch.stack(o_list, dim=0).transpose(1, 2).contiguous()
+    state = torch.stack(state_list, dim=0)
+    bias_state = torch.stack(bias_state_list, dim=0)
+    return o, state, bias_state
+
+
+class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        lambda_q: torch.Tensor,
+        lambda_k: torch.Tensor,
+        state0: torch.Tensor,
+        bias_state0: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        scale: float,
+        chunk_size: int,
+        has_initial_state: bool,
+    ):
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        ctx.has_initial_state = has_initial_state
+        ctx.has_cu_seqlens = cu_seqlens.numel() > 0
+        ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0, cu_seqlens)
+        initial_state = (state0, bias_state0) if has_initial_state else None
+        cu_seqlens_arg = cu_seqlens if ctx.has_cu_seqlens else None
+        with torch.no_grad():
+            o, state, bias_state = _chunk_gated_delta_rule_rank1_dc_reference(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
                 scale=scale,
+                initial_state=initial_state,
+                cu_seqlens=cu_seqlens_arg,
                 chunk_size=chunk_size,
-                state=init_state[batch_idx],
-                bias_state=init_bias_state[batch_idx],
             )
-            o_list.append(o_i)
-            state_list.append(state_i)
-            bias_state_list.append(bias_state_i)
-        o = torch.stack(o_list, dim=0).transpose(1, 2).contiguous()
-        state = torch.stack(state_list, dim=0)
-        bias_state = torch.stack(bias_state_list, dim=0)
+        return o, state, bias_state
+
+    @staticmethod
+    def backward(ctx, do: torch.Tensor, dstate: torch.Tensor, dbias_state: torch.Tensor):
+        q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0, cu_seqlens = ctx.saved_tensors
+        with torch.enable_grad():
+            q_ = q.detach().requires_grad_(q.requires_grad)
+            k_ = k.detach().requires_grad_(k.requires_grad)
+            v_ = v.detach().requires_grad_(v.requires_grad)
+            g_ = g.detach().requires_grad_(g.requires_grad)
+            beta_ = beta.detach().requires_grad_(beta.requires_grad)
+            lambda_q_ = lambda_q.detach().requires_grad_(lambda_q.requires_grad)
+            lambda_k_ = lambda_k.detach().requires_grad_(lambda_k.requires_grad)
+            state0_ = state0.detach().requires_grad_(ctx.has_initial_state and state0.requires_grad)
+            bias_state0_ = bias_state0.detach().requires_grad_(ctx.has_initial_state and bias_state0.requires_grad)
+            initial_state = (state0_, bias_state0_) if ctx.has_initial_state else None
+            cu_seqlens_arg = cu_seqlens if ctx.has_cu_seqlens else None
+            o, state, bias_state = _chunk_gated_delta_rule_rank1_dc_reference(
+                q=q_,
+                k=k_,
+                v=v_,
+                g=g_,
+                beta=beta_,
+                lambda_q=lambda_q_,
+                lambda_k=lambda_k_,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                cu_seqlens=cu_seqlens_arg,
+                chunk_size=ctx.chunk_size,
+            )
+            if dstate is None:
+                dstate = torch.zeros_like(state)
+            if dbias_state is None:
+                dbias_state = torch.zeros_like(bias_state)
+            grads = torch.autograd.grad(
+                outputs=(o, state, bias_state),
+                inputs=(q_, k_, v_, g_, beta_, lambda_q_, lambda_k_, state0_, bias_state0_),
+                grad_outputs=(do, dstate, dbias_state),
+                allow_unused=True,
+            )
+        return (*grads, None, None, None, None)
+
+
+@torch.compiler.disable
+def chunk_gated_delta_rule_rank1_dc(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float = None,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    **kwargs,
+):
+    orig_dtype = v.dtype
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    use_triton_chunk_local = (
+        cu_seqlens is None
+        and q.is_cuda
+        and (not torch.is_grad_enabled())
+        and not any(x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k))
+    )
+
+    if use_triton_chunk_local:
+        o, final_state = _chunk_rank1_dc_triton_local(
+            q=q.to(torch.float32),
+            k=k.to(torch.float32),
+            v=v.to(torch.float32),
+            g=g.to(torch.float32),
+            beta=beta.to(torch.float32),
+            lambda_q=lambda_q.to(torch.float32),
+            lambda_k=lambda_k.to(torch.float32),
+            scale=scale,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+        return o.to(orig_dtype), final_state
+
+    needs_explicit_backward = torch.is_grad_enabled() and (
+        any(x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k))
+        or (initial_state is not None and any(x.requires_grad for x in initial_state))
+    )
+
+    if needs_explicit_backward:
+        if initial_state is None:
+            state0 = q.new_zeros(0, dtype=torch.float32)
+            bias_state0 = q.new_zeros(0, dtype=torch.float32)
+            has_initial_state = False
+        else:
+            state0, bias_state0 = initial_state
+            has_initial_state = True
+        cu_seqlens_tensor = cu_seqlens if cu_seqlens is not None else q.new_empty((0,), dtype=torch.long)
+        o, state, bias_state = ChunkGatedDeltaRuleRank1DCFunction.apply(
+            q, k, v, g, beta, lambda_q, lambda_k,
+            state0, bias_state0, cu_seqlens_tensor,
+            scale, chunk_size, has_initial_state,
+        )
+    else:
+        o, state, bias_state = _chunk_gated_delta_rule_rank1_dc_reference(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            lambda_q=lambda_q,
+            lambda_k=lambda_k,
+            scale=scale,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+        )
 
     if not output_final_state:
         return o.to(orig_dtype), None
