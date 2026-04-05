@@ -1027,18 +1027,20 @@ def chunk_gated_delta_rule_rank1_dc(
             )
         num_seq = len(cu_seqlens) - 1
         num_heads, k_dim, v_dim = q.shape[2], q.shape[3], v.shape[-1]
-        o = torch.zeros(1, q.shape[1], num_heads, v_dim, device=v.device, dtype=torch.float32)
-        if initial_state is None:
-            state = torch.zeros(num_seq, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
-            bias_state = torch.zeros(num_seq, num_heads, v_dim, device=v.device, dtype=torch.float32)
-        else:
-            state, bias_state = initial_state
-            state = state.to(torch.float32).clone()
-            bias_state = bias_state.to(torch.float32).clone()
+        init_state = torch.zeros(num_seq, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
+        init_bias_state = torch.zeros(num_seq, num_heads, v_dim, device=v.device, dtype=torch.float32)
+        if initial_state is not None:
+            init_state, init_bias_state = initial_state
+            init_state = init_state.to(torch.float32).clone()
+            init_bias_state = init_bias_state.to(torch.float32).clone()
+        o_segments = []
+        state_segments = []
+        bias_segments = []
+        spans = []
         for n in range(num_seq):
             bos = int(cu_seqlens[n].item())
             eos = int(cu_seqlens[n + 1].item())
-            o_n, state[n], bias_state[n] = _chunk_rank1_dc_single_sequence(
+            o_n, state_n, bias_state_n = _chunk_rank1_dc_single_sequence(
                 q=q[0, bos:eos].transpose(0, 1).contiguous(),
                 k=k[0, bos:eos].transpose(0, 1).contiguous(),
                 v=v[0, bos:eos].transpose(0, 1).contiguous(),
@@ -1048,26 +1050,36 @@ def chunk_gated_delta_rule_rank1_dc(
                 lambda_k=lambda_k[0, bos:eos].transpose(0, 1).contiguous(),
                 scale=scale,
                 chunk_size=chunk_size,
-                state=state[n],
-                bias_state=bias_state[n],
+                state=init_state[n],
+                bias_state=init_bias_state[n],
             )
-            o[0, bos:eos] = o_n.transpose(0, 1)
+            spans.append((bos, eos))
+            o_segments.append(o_n.transpose(0, 1))
+            state_segments.append(state_n)
+            bias_segments.append(bias_state_n)
+        o = torch.zeros(1, q.shape[1], num_heads, v_dim, device=v.device, dtype=torch.float32)
+        for (bos, eos), o_n in zip(spans, o_segments):
+            o = o.clone()
+            o[0, bos:eos] = o_n
+        state = torch.stack(state_segments, dim=0)
+        bias_state = torch.stack(bias_segments, dim=0)
     else:
         q, k, v, g, beta, lambda_q, lambda_k = map(
             lambda x: x.transpose(1, 2).contiguous(),
             [q, k, v, g, beta, lambda_q, lambda_k],
         )
         batch_size, num_heads, seq_len, k_dim, v_dim = *k.shape, v.shape[-1]
-        o = torch.zeros(batch_size, num_heads, seq_len, v_dim, device=v.device, dtype=torch.float32)
-        if initial_state is None:
-            state = torch.zeros(batch_size, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
-            bias_state = torch.zeros(batch_size, num_heads, v_dim, device=v.device, dtype=torch.float32)
-        else:
-            state, bias_state = initial_state
-            state = state.to(torch.float32).clone()
-            bias_state = bias_state.to(torch.float32).clone()
+        init_state = torch.zeros(batch_size, num_heads, k_dim, v_dim, device=v.device, dtype=torch.float32)
+        init_bias_state = torch.zeros(batch_size, num_heads, v_dim, device=v.device, dtype=torch.float32)
+        if initial_state is not None:
+            init_state, init_bias_state = initial_state
+            init_state = init_state.to(torch.float32).clone()
+            init_bias_state = init_bias_state.to(torch.float32).clone()
+        o_list = []
+        state_list = []
+        bias_state_list = []
         for batch_idx in range(batch_size):
-            o[batch_idx], state[batch_idx], bias_state[batch_idx] = _chunk_rank1_dc_single_sequence(
+            o_i, state_i, bias_state_i = _chunk_rank1_dc_single_sequence(
                 q=q[batch_idx],
                 k=k[batch_idx],
                 v=v[batch_idx],
@@ -1077,10 +1089,15 @@ def chunk_gated_delta_rule_rank1_dc(
                 lambda_k=lambda_k[batch_idx],
                 scale=scale,
                 chunk_size=chunk_size,
-                state=state[batch_idx],
-                bias_state=bias_state[batch_idx],
+                state=init_state[batch_idx],
+                bias_state=init_bias_state[batch_idx],
             )
-        o = o.transpose(1, 2).contiguous()
+            o_list.append(o_i)
+            state_list.append(state_i)
+            bias_state_list.append(bias_state_i)
+        o = torch.stack(o_list, dim=0).transpose(1, 2).contiguous()
+        state = torch.stack(state_list, dim=0)
+        bias_state = torch.stack(bias_state_list, dim=0)
 
     if not output_final_state:
         return o.to(orig_dtype), None
