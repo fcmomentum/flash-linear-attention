@@ -168,8 +168,8 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
         h = torch.zeros(num_seq, H, K, V, device=v.device, dtype=torch.float32)
         b = torch.zeros(num_seq, H, V, device=v.device, dtype=torch.float32)
         if initial_state is not None:
-            h = initial_state[0].to(torch.float32)
-            b = initial_state[1].to(torch.float32)
+            h = initial_state[0].to(torch.float32).clone()
+            b = initial_state[1].to(torch.float32).clone()
         for n in range(num_seq):
             bos = int(cu_seqlens[n].item())
             eos = int(cu_seqlens[n + 1].item())
@@ -203,8 +203,8 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
         h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
         b = torch.zeros(B, H, V, device=v.device, dtype=torch.float32)
         if initial_state is not None:
-            h = initial_state[0].to(torch.float32)
-            b = initial_state[1].to(torch.float32)
+            h = initial_state[0].to(torch.float32).clone()
+            b = initial_state[1].to(torch.float32).clone()
         for batch_idx in range(B):
             o[batch_idx], h[batch_idx], b[batch_idx] = _run_rank1_dc_single_sequence(
                 q=q[batch_idx],
