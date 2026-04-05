@@ -1029,8 +1029,8 @@ def chunk_gated_delta_rule_rank1_dc(
             bias_state = torch.zeros(num_seq, num_heads, v_dim, device=v.device, dtype=torch.float32)
         else:
             state, bias_state = initial_state
-            state = state.to(torch.float32)
-            bias_state = bias_state.to(torch.float32)
+            state = state.to(torch.float32).clone()
+            bias_state = bias_state.to(torch.float32).clone()
         for n in range(num_seq):
             bos = int(cu_seqlens[n].item())
             eos = int(cu_seqlens[n + 1].item())
@@ -1060,8 +1060,8 @@ def chunk_gated_delta_rule_rank1_dc(
             bias_state = torch.zeros(batch_size, num_heads, v_dim, device=v.device, dtype=torch.float32)
         else:
             state, bias_state = initial_state
-            state = state.to(torch.float32)
-            bias_state = bias_state.to(torch.float32)
+            state = state.to(torch.float32).clone()
+            bias_state = bias_state.to(torch.float32).clone()
         for batch_idx in range(batch_size):
             o[batch_idx], state[batch_idx], bias_state[batch_idx] = _chunk_rank1_dc_single_sequence(
                 q=q[batch_idx],
