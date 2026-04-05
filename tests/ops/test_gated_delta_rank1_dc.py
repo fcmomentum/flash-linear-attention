@@ -283,3 +283,165 @@ def test_rank1_dc_fused_recurrent_backward_not_implemented(
             use_qk_l2norm_in_kernel=False,
             **inputs,
         )
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'K', 'V', 'dtype'),
+    [
+        (1, 256, 4, 32, 32, torch.float32),
+    ],
+)
+def test_rank1_dc_chunk_exact_backward_chunk64_reasonable_error(
+    B: int,
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    ref_inputs = _make_rank1_dc_inputs_requires_grad(B, T, H, K, V, dtype)
+    tri_inputs = _make_rank1_dc_inputs_requires_grad(B, T, H, K, V, dtype)
+
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(
+        output_final_state=True,
+        **ref_inputs,
+    )
+    tri_o, tri_state = chunk_gated_delta_rule_rank1_dc(
+        output_final_state=True,
+        chunk_size=64,
+        **tri_inputs,
+    )
+
+    do = torch.randn_like(ref_o)
+    dht = torch.randn_like(ref_state[0])
+    dbt = torch.randn_like(ref_state[1])
+
+    ((ref_o * do).sum() + (ref_state[0] * dht).sum() + (ref_state[1] * dbt).sum()).backward()
+    ((tri_o * do).sum() + (tri_state[0] * dht).sum() + (tri_state[1] * dbt).sum()).backward()
+
+    ref_grads = _collect_grads(ref_inputs)
+    tri_grads = _collect_grads(tri_inputs)
+    for name, tol in [
+        ('q', 0.05),
+        ('k', 0.08),
+        ('v', 0.05),
+        ('beta', 0.08),
+        ('g', 0.08),
+        ('lambda_q', 0.05),
+        ('lambda_k', 0.08),
+        ('state0', 0.12),
+        ('bias0', 0.08),
+    ]:
+        assert_close(name, ref_grads[name], tri_grads[name], tol)
+
+
+@pytest.mark.parametrize(
+    ('lengths', 'H', 'K', 'V', 'dtype'),
+    [
+        ([23, 41], 2, 32, 32, torch.float32),
+    ],
+)
+def test_rank1_dc_chunk_exact_backward_varlen_chunk1_matches_naive(
+    lengths,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    batch_size = len(lengths)
+    total = sum(lengths)
+    inputs = _make_rank1_dc_inputs(batch_size, max(lengths), H, K, V, dtype)
+
+    def _flatten_varlen(tensor):
+        pieces = []
+        for b_idx, length in enumerate(lengths):
+            pieces.append(tensor[b_idx, :length])
+        return torch.cat(pieces, dim=0).unsqueeze(0)
+
+    q = _flatten_varlen(inputs['q']).clone().requires_grad_(True)
+    k = _flatten_varlen(inputs['k']).clone().requires_grad_(True)
+    v = _flatten_varlen(inputs['v']).clone().requires_grad_(True)
+    g = _flatten_varlen(inputs['g']).clone().requires_grad_(True)
+    beta = _flatten_varlen(inputs['beta']).clone().requires_grad_(True)
+    lambda_q = _flatten_varlen(inputs['lambda_q']).clone().requires_grad_(True)
+    lambda_k = _flatten_varlen(inputs['lambda_k']).clone().requires_grad_(True)
+    state0 = inputs['initial_state'][0][:batch_size].clone().requires_grad_(True)
+    bias0 = inputs['initial_state'][1][:batch_size].clone().requires_grad_(True)
+    cu_seqlens = torch.tensor([0] + [sum(lengths[:i + 1]) for i in range(len(lengths))], device=q.device, dtype=torch.long)
+
+    ref_inputs = {
+        'q': q,
+        'k': k,
+        'v': v,
+        'g': g,
+        'beta': beta,
+        'lambda_q': lambda_q,
+        'lambda_k': lambda_k,
+        'scale': inputs['scale'],
+        'initial_state': (state0, bias0),
+        'cu_seqlens': cu_seqlens,
+    }
+    tri_inputs = {
+        'q': q.detach().clone().requires_grad_(True),
+        'k': k.detach().clone().requires_grad_(True),
+        'v': v.detach().clone().requires_grad_(True),
+        'g': g.detach().clone().requires_grad_(True),
+        'beta': beta.detach().clone().requires_grad_(True),
+        'lambda_q': lambda_q.detach().clone().requires_grad_(True),
+        'lambda_k': lambda_k.detach().clone().requires_grad_(True),
+        'scale': inputs['scale'],
+        'initial_state': (
+            state0.detach().clone().requires_grad_(True),
+            bias0.detach().clone().requires_grad_(True),
+        ),
+        'cu_seqlens': cu_seqlens,
+    }
+
+    ref_o, ref_state = naive_recurrent_gated_delta_rule_rank1_dc(output_final_state=True, **ref_inputs)
+    tri_o, tri_state = chunk_gated_delta_rule_rank1_dc(
+        output_final_state=True,
+        chunk_size=1,
+        **tri_inputs,
+    )
+
+    do = torch.randn_like(ref_o)
+    dht = torch.randn_like(ref_state[0])
+    dbt = torch.randn_like(ref_state[1])
+
+    ((ref_o * do).sum() + (ref_state[0] * dht).sum() + (ref_state[1] * dbt).sum()).backward()
+    ((tri_o * do).sum() + (tri_state[0] * dht).sum() + (tri_state[1] * dbt).sum()).backward()
+
+    ref_named = {
+        'q': ref_inputs['q'],
+        'k': ref_inputs['k'],
+        'v': ref_inputs['v'],
+        'g': ref_inputs['g'],
+        'beta': ref_inputs['beta'],
+        'lambda_q': ref_inputs['lambda_q'],
+        'lambda_k': ref_inputs['lambda_k'],
+        'initial_state': ref_inputs['initial_state'],
+    }
+    tri_named = {
+        'q': tri_inputs['q'],
+        'k': tri_inputs['k'],
+        'v': tri_inputs['v'],
+        'g': tri_inputs['g'],
+        'beta': tri_inputs['beta'],
+        'lambda_q': tri_inputs['lambda_q'],
+        'lambda_k': tri_inputs['lambda_k'],
+        'initial_state': tri_inputs['initial_state'],
+    }
+    ref_grads = _collect_grads(ref_named)
+    tri_grads = _collect_grads(tri_named)
+    for name, tol in [
+        ('q', 0.003),
+        ('k', 0.003),
+        ('v', 0.003),
+        ('beta', 0.003),
+        ('g', 0.003),
+        ('lambda_q', 0.003),
+        ('lambda_k', 0.003),
+        ('state0', 0.003),
+        ('bias0', 0.003),
+    ]:
+        assert_close(name, ref_grads[name], tri_grads[name], tol)
