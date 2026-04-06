@@ -977,6 +977,50 @@ def _dense_rank1_dc_forward_batched(
     return o, (h, b), h_states, b_states
 
 
+def _dense_rank1_dc_boundary_states(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None,
+    chunk_size: int,
+):
+    del q, scale
+    kh, vh, gh, betah, lkh = (
+        k.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        v.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        g.permute(0, 2, 1).contiguous().to(torch.float32),
+        beta.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_k.permute(0, 2, 1).contiguous().to(torch.float32),
+    )
+    _, _, seq_len, k_dim = kh.shape
+    v_dim = vh.shape[-1]
+    if initial_state is None:
+        h = vh.new_zeros(kh.shape[0], kh.shape[1], k_dim, v_dim)
+        b = vh.new_zeros(kh.shape[0], kh.shape[1], v_dim)
+    else:
+        h = initial_state[0].to(torch.float32)
+        b = initial_state[1].to(torch.float32)
+
+    boundary_states = [(h, b)]
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        for t in range(start, end):
+            alpha_t = gh[:, :, t].exp()
+            h1 = h * alpha_t[..., None, None]
+            b1 = b * alpha_t[..., None]
+            pred = torch.einsum('bhkv,bhk->bhv', h1, kh[:, :, t]) - lkh[:, :, t][..., None] * b1
+            delta = betah[:, :, t][..., None] * (vh[:, :, t] - pred)
+            h = h1 + torch.einsum('bhk,bhv->bhkv', kh[:, :, t], delta)
+            b = b1 + delta
+        boundary_states.append((h, b))
+    return boundary_states
+
+
 def _dense_rank1_dc_backward_batched(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1472,7 +1516,7 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
             dbias_state = None
         initial_state = (state0, bias_state0) if ctx.has_initial_state else None
         with torch.no_grad():
-            _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+            boundary_states = _dense_rank1_dc_boundary_states(
                 q=q,
                 k=k,
                 v=v,
@@ -1482,22 +1526,59 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
                 lambda_k=lambda_k,
                 scale=ctx.scale,
                 initial_state=initial_state,
+                chunk_size=ctx.chunk_size,
             )
-        dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            lambda_q=lambda_q,
-            lambda_k=lambda_k,
-            scale=ctx.scale,
-            h_states=h_states,
-            b_states=b_states,
-            do=do,
-            dstate=dstate,
-            dbias_state=dbias_state,
-        )
+        seq_len = q.shape[1]
+        dq = torch.zeros_like(q, dtype=torch.float32)
+        dk = torch.zeros_like(k, dtype=torch.float32)
+        dv = torch.zeros_like(v, dtype=torch.float32)
+        dg = torch.zeros_like(g, dtype=torch.float32)
+        dbeta = torch.zeros_like(beta, dtype=torch.float32)
+        dlambda_q = torch.zeros_like(lambda_q, dtype=torch.float32)
+        dlambda_k = torch.zeros_like(lambda_k, dtype=torch.float32)
+        dh = None if dstate is None else dstate.to(torch.float32)
+        db = None if dbias_state is None else dbias_state.to(torch.float32)
+
+        num_chunks = len(boundary_states) - 1
+        for chunk_idx in range(num_chunks - 1, -1, -1):
+            start = chunk_idx * ctx.chunk_size
+            end = min(start + ctx.chunk_size, seq_len)
+            chunk_initial_state = boundary_states[chunk_idx]
+            with torch.no_grad():
+                _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    lambda_q=lambda_q[:, start:end],
+                    lambda_k=lambda_k[:, start:end],
+                    scale=ctx.scale,
+                    initial_state=chunk_initial_state,
+                )
+            dq_i, dk_i, dv_i, dg_i, dbeta_i, dlambda_q_i, dlambda_k_i, dh, db = _dense_rank1_dc_backward_batched(
+                q=q[:, start:end],
+                k=k[:, start:end],
+                v=v[:, start:end],
+                g=g[:, start:end],
+                beta=beta[:, start:end],
+                lambda_q=lambda_q[:, start:end],
+                lambda_k=lambda_k[:, start:end],
+                scale=ctx.scale,
+                h_states=h_states,
+                b_states=b_states,
+                do=do[:, start:end],
+                dstate=dh,
+                dbias_state=db,
+            )
+            dq[:, start:end] = dq_i
+            dk[:, start:end] = dk_i
+            dv[:, start:end] = dv_i
+            dg[:, start:end] = dg_i
+            dbeta[:, start:end] = dbeta_i
+            dlambda_q[:, start:end] = dlambda_q_i
+            dlambda_k[:, start:end] = dlambda_k_i
+        dstate0, dbias0 = dh, db
         dq = dq.to(q.dtype)
         dk = dk.to(k.dtype)
         dv = dv.to(v.dtype)
