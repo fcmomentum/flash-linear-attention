@@ -925,6 +925,148 @@ def _chunk_rank1_dc_triton_local(
     return o, (state, bias_state)
 
 
+def _dense_rank1_dc_forward_batched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None,
+):
+    qh, kh, vh, gh, betah, lqh, lkh = (
+        q.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        k.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        v.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        g.permute(0, 2, 1).contiguous().to(torch.float32),
+        beta.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_q.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_k.permute(0, 2, 1).contiguous().to(torch.float32),
+    )
+    batch_size, num_heads, seq_len, k_dim = qh.shape
+    v_dim = vh.shape[-1]
+
+    if initial_state is None:
+        h = vh.new_zeros(batch_size, num_heads, k_dim, v_dim)
+        b = vh.new_zeros(batch_size, num_heads, v_dim)
+    else:
+        h = initial_state[0].to(torch.float32)
+        b = initial_state[1].to(torch.float32)
+
+    h_states = [h]
+    b_states = [b]
+    outputs = []
+
+    for t in range(seq_len):
+        alpha_t = gh[:, :, t].exp()
+        h1 = h * alpha_t[..., None, None]
+        b1 = b * alpha_t[..., None]
+        pred = torch.einsum('bhkv,bhk->bhv', h1, kh[:, :, t]) - lkh[:, :, t][..., None] * b1
+        delta = betah[:, :, t][..., None] * (vh[:, :, t] - pred)
+        h = h1 + torch.einsum('bhk,bhv->bhkv', kh[:, :, t], delta)
+        b = b1 + delta
+        outputs.append(scale * torch.einsum('bhk,bhkv->bhv', qh[:, :, t], h) - lqh[:, :, t][..., None] * b)
+        h_states.append(h)
+        b_states.append(b)
+
+    o = torch.stack(outputs, dim=2).permute(0, 2, 1, 3).contiguous()
+    h_states = torch.stack(h_states, dim=2)
+    b_states = torch.stack(b_states, dim=2)
+    return o, (h, b), h_states, b_states
+
+
+def _dense_rank1_dc_backward_batched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    h_states: torch.Tensor,
+    b_states: torch.Tensor,
+    do: torch.Tensor,
+    dstate: torch.Tensor | None,
+    dbias_state: torch.Tensor | None,
+):
+    qh, kh, vh, gh, betah, lqh, lkh, doh = (
+        q.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        k.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        v.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        g.permute(0, 2, 1).contiguous().to(torch.float32),
+        beta.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_q.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_k.permute(0, 2, 1).contiguous().to(torch.float32),
+        do.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+    )
+
+    batch_size, num_heads, seq_len, k_dim = qh.shape
+    v_dim = vh.shape[-1]
+    dh = h_states.new_zeros(batch_size, num_heads, k_dim, v_dim) if dstate is None else dstate.to(torch.float32)
+    db = b_states.new_zeros(batch_size, num_heads, v_dim) if dbias_state is None else dbias_state.to(torch.float32)
+
+    dq = torch.zeros_like(qh)
+    dk = torch.zeros_like(kh)
+    dv = torch.zeros_like(vh)
+    dg = torch.zeros_like(gh)
+    dbeta = torch.zeros_like(betah)
+    dlambda_q = torch.zeros_like(lqh)
+    dlambda_k = torch.zeros_like(lkh)
+
+    for t in range(seq_len - 1, -1, -1):
+        h_prev = h_states[:, :, t]
+        h_t = h_states[:, :, t + 1]
+        b_prev = b_states[:, :, t]
+        b_t = b_states[:, :, t + 1]
+
+        q_t = qh[:, :, t]
+        k_t = kh[:, :, t]
+        v_t = vh[:, :, t]
+        do_t = doh[:, :, t]
+        alpha_t = gh[:, :, t].exp()
+        beta_t = betah[:, :, t]
+        lambda_q_t = lqh[:, :, t]
+        lambda_k_t = lkh[:, :, t]
+
+        dq[:, :, t] = scale * torch.einsum('bhv,bhkv->bhk', do_t, h_t)
+        dh = dh + scale * torch.einsum('bhk,bhv->bhkv', q_t, do_t)
+        dlambda_q[:, :, t] = -(b_t * do_t).sum(-1)
+        db = db - lambda_q_t[..., None] * do_t
+
+        h1 = alpha_t[..., None, None] * h_prev
+        b1 = alpha_t[..., None] * b_prev
+        pred = torch.einsum('bhkv,bhk->bhv', h1, k_t) - lambda_k_t[..., None] * b1
+        innovation = v_t - pred
+
+        dk[:, :, t] = torch.einsum('bhkv,bhv->bhk', dh, beta_t[..., None] * innovation)
+        ddelta = torch.einsum('bhkv,bhk->bhv', dh, k_t) + db
+        dbeta[:, :, t] = (ddelta * innovation).sum(-1)
+        dv[:, :, t] = beta_t[..., None] * ddelta
+        dpred = -beta_t[..., None] * ddelta
+
+        dh1 = dh + torch.einsum('bhk,bhv->bhkv', k_t, dpred)
+        dk[:, :, t] = dk[:, :, t] + torch.einsum('bhkv,bhv->bhk', h1, dpred)
+        dlambda_k[:, :, t] = -(b1 * dpred).sum(-1)
+        db1 = db - lambda_k_t[..., None] * dpred
+
+        dalpha = (dh1 * h_prev).sum(dim=(-1, -2)) + (db1 * b_prev).sum(dim=-1)
+        dh = alpha_t[..., None, None] * dh1
+        db = alpha_t[..., None] * db1
+        dg[:, :, t] = dalpha * alpha_t
+
+    dq = dq.permute(0, 2, 1, 3).contiguous()
+    dk = dk.permute(0, 2, 1, 3).contiguous()
+    dv = dv.permute(0, 2, 1, 3).contiguous()
+    dg = dg.permute(0, 2, 1).contiguous()
+    dbeta = dbeta.permute(0, 2, 1).contiguous()
+    dlambda_q = dlambda_q.permute(0, 2, 1).contiguous()
+    dlambda_k = dlambda_k.permute(0, 2, 1).contiguous()
+    return dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dh, db
+
+
 def _chunk_rank1_dc_single_sequence(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1307,20 +1449,20 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0, cu_seqlens)
         initial_state = (state0, bias_state0) if has_initial_state else None
         with torch.no_grad():
-            o, final_state = _chunk_rank1_dc_triton_local(
-                q=q.to(torch.float32),
-                k=k.to(torch.float32),
-                v=v.to(torch.float32),
-                g=g.to(torch.float32),
-                beta=beta.to(torch.float32),
-                lambda_q=lambda_q.to(torch.float32),
-                lambda_k=lambda_k.to(torch.float32),
+            o, final_state, h_states, b_states = _dense_rank1_dc_forward_batched(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
                 scale=scale,
-                chunk_size=chunk_size,
                 initial_state=initial_state,
-                output_final_state=True,
             )
             state, bias_state = final_state
+        ctx.h_states = h_states
+        ctx.b_states = b_states
         return o, state, bias_state
 
     @staticmethod
@@ -1331,7 +1473,7 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         if dbias_state is None:
             dbias_state = None
         initial_state = (state0, bias_state0) if ctx.has_initial_state else None
-        dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _chunk_gated_delta_rule_rank1_dc_backward_reference(
+        dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
             q=q,
             k=k,
             v=v,
@@ -1340,8 +1482,8 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
             lambda_q=lambda_q,
             lambda_k=lambda_k,
             scale=ctx.scale,
-            initial_state=initial_state,
-            cu_seqlens=None,
+            h_states=ctx.h_states,
+            b_states=ctx.b_states,
             do=do,
             dstate=dstate,
             dbias_state=dbias_state,

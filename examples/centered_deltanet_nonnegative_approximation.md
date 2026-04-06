@@ -1751,3 +1751,108 @@ The most informative test settings are:
 
 - `chunk_size = 1`, which should match the recurrent reference nearly exactly,
 - moderate chunk sizes such as `32` or `64`, which test the true chunked backward path.
+
+## Current Kernelization Status for Rank-1 DC Removal
+
+In the current implementation in [chunk.py](../fla/ops/gated_delta_rule/chunk.py), the dense CUDA forward path for rank-1 DC removal is partially optimized, but the backward path is still the main bottleneck.
+
+### Present Asymmetry
+
+The current state is:
+
+- forward on dense CUDA inputs can use an optimized chunk-local path
+- backward still relies on an analytical reference implementation
+
+So for training, the slow part is not the forward recurrence itself, but the backward pass.
+
+### Recurrence View
+
+For each head, rank-1 DC removal augments the usual DeltaNet state with one extra bias state:
+
+$$
+h_t \in \mathbb{R}^{K \times V},
+\qquad
+b_t \in \mathbb{R}^{V}.
+$$
+
+The recurrence can be written as
+
+$$
+h_t^{(1)} = \alpha_t h_{t-1},
+\qquad
+b_t^{(1)} = \alpha_t b_{t-1},
+$$
+$$
+\mathrm{pred}_t = k_t^\top h_t^{(1)} - \lambda_k(t) b_t^{(1)},
+$$
+$$
+\delta_t = \beta_t (v_t - \mathrm{pred}_t),
+$$
+$$
+h_t = h_t^{(1)} + k_t \delta_t^\top,
+\qquad
+b_t = b_t^{(1)} + \delta_t,
+$$
+$$
+o_t = \mathrm{scale} \cdot q_t^\top h_t - \lambda_q(t) b_t.
+$$
+
+This is still a structured local scan, so it should admit a fused backward.
+
+### Why `torch.compile` Is Not the Real Fix
+
+Even if the wrapper code is compile-friendly, the main training cost remains the reference backward:
+
+- explicit Python/Torch looping over batch, heads, and timesteps
+- no fused reverse scan for the augmented state \((h_t, b_t)\)
+- no chunk-native backward kernel yet
+
+So `torch.compile` can reduce wrapper overhead, but it cannot replace a real fused backward kernel.
+
+### Recommended Kernelization Plan
+
+The practical development order should be:
+
+1. Implement a dense CUDA recurrent backward for rank-1 DC removal.
+2. Use that recurrent backward inside chunk-local training first.
+3. Replace the Python chunk backward with a chunk-native reverse scan only after the recurrent backward is solid.
+4. Add `cu_seqlens` support only after the dense path is stable.
+
+### Dense CUDA Recurrent Backward
+
+The first missing optimized piece is a backward-capable recurrent kernel that computes:
+
+- \(d q\)
+- \(d k\)
+- \(d v\)
+- \(d g\)
+- \(d \beta\)
+- \(d \lambda_q\)
+- \(d \lambda_k\)
+- \(d h_0\)
+- \(d b_0\)
+
+for dense CUDA inputs.
+
+This is the lowest-risk step because it follows the recurrence directly, without needing chunk compression logic first.
+
+### Chunk-Native Backward
+
+Once recurrent backward exists, the next step is a chunk-native backward that reuses the chunk transfer factors already constructed in forward. The goal is to operate chunk-by-chunk instead of token-by-token in Python.
+
+At a high level, the backward should expose:
+
+- chunk transition for the matrix state
+- chunk transition for the bias state
+- chunk-local readout adjoints
+
+This is the right place to recover training throughput on long sequences.
+
+### Design Principle
+
+The clean way to think about rank-1 DC removal is:
+
+- standard gated DeltaNet state
+- plus one extra value-space bias state
+
+So the long-term solution is not more compile tuning around Python wrappers, but a real fused backward for the augmented state dynamics.
