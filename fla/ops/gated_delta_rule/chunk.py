@@ -1299,40 +1299,28 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.has_initial_state = has_initial_state
         ctx.has_cu_seqlens = cu_seqlens.numel() > 0
-        ctx.use_optimized_forward = q.is_cuda and not ctx.has_cu_seqlens
+        if (not q.is_cuda) or ctx.has_cu_seqlens:
+            raise NotImplementedError(
+                "ChunkGatedDeltaRuleRank1DCFunction only supports CUDA dense inputs. "
+                "Variable-length inputs and non-CUDA execution are not supported in the optimized path.",
+            )
         ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0, cu_seqlens)
         initial_state = (state0, bias_state0) if has_initial_state else None
-        cu_seqlens_arg = cu_seqlens if ctx.has_cu_seqlens else None
         with torch.no_grad():
-            if ctx.use_optimized_forward:
-                o, final_state = _chunk_rank1_dc_triton_local(
-                    q=q.to(torch.float32),
-                    k=k.to(torch.float32),
-                    v=v.to(torch.float32),
-                    g=g.to(torch.float32),
-                    beta=beta.to(torch.float32),
-                    lambda_q=lambda_q.to(torch.float32),
-                    lambda_k=lambda_k.to(torch.float32),
-                    scale=scale,
-                    chunk_size=chunk_size,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                )
-                state, bias_state = final_state
-            else:
-                o, state, bias_state = _chunk_gated_delta_rule_rank1_dc_reference(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    lambda_q=lambda_q,
-                    lambda_k=lambda_k,
-                    scale=scale,
-                    initial_state=initial_state,
-                    cu_seqlens=cu_seqlens_arg,
-                    chunk_size=chunk_size,
-                )
+            o, final_state = _chunk_rank1_dc_triton_local(
+                q=q.to(torch.float32),
+                k=k.to(torch.float32),
+                v=v.to(torch.float32),
+                g=g.to(torch.float32),
+                beta=beta.to(torch.float32),
+                lambda_q=lambda_q.to(torch.float32),
+                lambda_k=lambda_k.to(torch.float32),
+                scale=scale,
+                chunk_size=chunk_size,
+                initial_state=initial_state,
+                output_final_state=True,
+            )
+            state, bias_state = final_state
         return o, state, bias_state
 
     @staticmethod
@@ -1343,7 +1331,6 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         if dbias_state is None:
             dbias_state = None
         initial_state = (state0, bias_state0) if ctx.has_initial_state else None
-        cu_seqlens_arg = cu_seqlens if ctx.has_cu_seqlens else None
         dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _chunk_gated_delta_rule_rank1_dc_backward_reference(
             q=q,
             k=k,
@@ -1354,7 +1341,7 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
             lambda_k=lambda_k,
             scale=ctx.scale,
             initial_state=initial_state,
-            cu_seqlens=cu_seqlens_arg,
+            cu_seqlens=None,
             do=do,
             dstate=dstate,
             dbias_state=dbias_state,
@@ -1372,7 +1359,6 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         return dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0, None, None, None, None
 
 
-@torch.compiler.disable
 def chunk_gated_delta_rule_rank1_dc(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1391,11 +1377,14 @@ def chunk_gated_delta_rule_rank1_dc(
     orig_dtype = v.dtype
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if (not q.is_cuda) or cu_seqlens is not None:
+        raise NotImplementedError(
+            "chunk_gated_delta_rule_rank1_dc only supports CUDA dense inputs. "
+            "Non-CUDA and `cu_seqlens` fallback paths were removed.",
+        )
 
     use_triton_chunk_local = (
-        cu_seqlens is None
-        and q.is_cuda
-        and (not torch.is_grad_enabled())
+        (not torch.is_grad_enabled())
         and not any(x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k))
     )
 
@@ -1420,7 +1409,7 @@ def chunk_gated_delta_rule_rank1_dc(
         or (initial_state is not None and any(x.requires_grad for x in initial_state))
     )
 
-    use_autograd_wrapper = needs_explicit_backward and q.is_cuda and cu_seqlens is None
+    use_autograd_wrapper = needs_explicit_backward
 
     if use_autograd_wrapper:
         if initial_state is None:
@@ -1430,40 +1419,27 @@ def chunk_gated_delta_rule_rank1_dc(
         else:
             state0, bias_state0 = initial_state
             has_initial_state = True
-        cu_seqlens_tensor = cu_seqlens if cu_seqlens is not None else q.new_empty((0,), dtype=torch.long)
-        o, state, bias_state = ChunkGatedDeltaRuleRank1DCFunction.apply(
-            q, k, v, g, beta, lambda_q, lambda_k,
-            state0, bias_state0, cu_seqlens_tensor,
-            scale, chunk_size, has_initial_state,
-        )
-    elif needs_explicit_backward:
-        if initial_state is None:
-            state0 = q.new_zeros(0, dtype=torch.float32)
-            bias_state0 = q.new_zeros(0, dtype=torch.float32)
-            has_initial_state = False
-        else:
-            state0, bias_state0 = initial_state
-            has_initial_state = True
-        cu_seqlens_tensor = cu_seqlens if cu_seqlens is not None else q.new_empty((0,), dtype=torch.long)
+        cu_seqlens_tensor = q.new_empty((0,), dtype=torch.long)
         o, state, bias_state = ChunkGatedDeltaRuleRank1DCFunction.apply(
             q, k, v, g, beta, lambda_q, lambda_k,
             state0, bias_state0, cu_seqlens_tensor,
             scale, chunk_size, has_initial_state,
         )
     else:
-        o, state, bias_state = _chunk_gated_delta_rule_rank1_dc_reference(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            lambda_q=lambda_q,
-            lambda_k=lambda_k,
+        o, final_state = _chunk_rank1_dc_triton_local(
+            q=q.to(torch.float32),
+            k=k.to(torch.float32),
+            v=v.to(torch.float32),
+            g=g.to(torch.float32),
+            beta=beta.to(torch.float32),
+            lambda_q=lambda_q.to(torch.float32),
+            lambda_k=lambda_k.to(torch.float32),
             scale=scale,
-            initial_state=initial_state,
-            cu_seqlens=cu_seqlens,
             chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
         )
+        state, bias_state = (None, None) if final_state is None else final_state
 
     if not output_final_state:
         return o.to(orig_dtype), None
