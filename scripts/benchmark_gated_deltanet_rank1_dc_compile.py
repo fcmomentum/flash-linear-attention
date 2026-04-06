@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-short-conv", action="store_true", default=False)
     parser.add_argument("--use-gate", action="store_true", default=False)
     parser.add_argument("--allow-neg-eigval", action="store_true", default=False)
+    parser.add_argument(
+        "--use-padding-mask",
+        action="store_true",
+        default=False,
+        help="Pass an attention_mask with left padding. Disabled by default because rank-1 DC chunk mode is dense-only.",
+    )
     return parser.parse_args()
 
 
@@ -139,8 +145,10 @@ def main() -> None:
     )
 
     hidden_states = torch.randn(args.batch_size, args.seq_len, args.hidden_size, device=device, dtype=dtype)
-    attention_mask = torch.ones(args.batch_size, args.seq_len, device=device, dtype=torch.bool)
-    attention_mask[:, : args.seq_len // 8] = False
+    attention_mask = None
+    if args.use_padding_mask:
+        attention_mask = torch.ones(args.batch_size, args.seq_len, device=device, dtype=torch.bool)
+        attention_mask[:, : args.seq_len // 8] = False
 
     def run_eval() -> torch.Tensor:
         return compiled_model(hidden_states, attention_mask=attention_mask, use_cache=False)
