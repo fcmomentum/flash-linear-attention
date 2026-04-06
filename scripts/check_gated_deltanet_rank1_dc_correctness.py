@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 import torch
+import torch.nn.functional as F
 
 from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_rank1_dc
 from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule_rank1_dc
@@ -26,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-initial-state", action="store_true")
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--atol", type=float, default=1e-4)
+    parser.add_argument(
+        "--stress-random-init",
+        action="store_true",
+        default=False,
+        help="Use unconstrained random inputs. Disabled by default because the recurrence can become numerically ill-conditioned in float32.",
+    )
     return parser.parse_args()
 
 
@@ -41,7 +48,7 @@ def clone_for_grad(x: torch.Tensor) -> torch.Tensor:
 
 def compare_tensor(name: str, ref: torch.Tensor, test: torch.Tensor, rtol: float, atol: float) -> None:
     max_abs = (ref - test).abs().max().item()
-    max_rel = ((ref - test).abs() / test.abs().clamp_min(1e-12)).max().item()
+    max_rel = ((ref - test).abs() / ref.abs().clamp_min(1e-12)).max().item()
     print(f"{name}: max_abs={max_abs:.6e} max_rel={max_rel:.6e}")
     torch.testing.assert_close(ref, test, rtol=rtol, atol=atol)
 
@@ -61,19 +68,31 @@ def main() -> None:
     shape_h0 = (args.batch_size, args.num_heads, args.k_dim, args.v_dim)
     shape_b0 = (args.batch_size, args.num_heads, args.v_dim)
 
-    q = torch.randn(shape_qk, device=device, dtype=dtype)
-    k = torch.randn(shape_qk, device=device, dtype=dtype)
-    v = torch.randn(shape_v, device=device, dtype=dtype)
-    g = torch.randn(shape_gate, device=device, dtype=dtype)
-    beta = torch.sigmoid(torch.randn(shape_gate, device=device, dtype=dtype))
-    lambda_q = torch.randn(shape_gate, device=device, dtype=dtype)
-    lambda_k = torch.randn(shape_gate, device=device, dtype=dtype)
+    if args.stress_random_init:
+        q = torch.randn(shape_qk, device=device, dtype=dtype)
+        k = torch.randn(shape_qk, device=device, dtype=dtype)
+        v = torch.randn(shape_v, device=device, dtype=dtype)
+        g = torch.randn(shape_gate, device=device, dtype=dtype)
+        beta = torch.sigmoid(torch.randn(shape_gate, device=device, dtype=dtype))
+        lambda_q = torch.randn(shape_gate, device=device, dtype=dtype)
+        lambda_k = torch.randn(shape_gate, device=device, dtype=dtype)
+    else:
+        # Keep the recurrence well conditioned by default:
+        # alpha = exp(g) stays in (0, 1), beta is moderate, and the projections are scaled down.
+        q = 0.25 * torch.randn(shape_qk, device=device, dtype=dtype)
+        k = 0.25 * torch.randn(shape_qk, device=device, dtype=dtype)
+        v = 0.25 * torch.randn(shape_v, device=device, dtype=dtype)
+        g = F.logsigmoid(torch.randn(shape_gate, device=device, dtype=dtype))
+        beta = 0.25 + 0.5 * torch.sigmoid(torch.randn(shape_gate, device=device, dtype=dtype))
+        lambda_q = 0.1 * torch.randn(shape_gate, device=device, dtype=dtype)
+        lambda_k = 0.1 * torch.randn(shape_gate, device=device, dtype=dtype)
 
     initial_state = None
     if args.with_initial_state:
+        init_scale = 1.0 if args.stress_random_init else 0.05
         initial_state = (
-            torch.randn(shape_h0, device=device, dtype=dtype),
-            torch.randn(shape_b0, device=device, dtype=dtype),
+            init_scale * torch.randn(shape_h0, device=device, dtype=dtype),
+            init_scale * torch.randn(shape_b0, device=device, dtype=dtype),
         )
 
     ref_inputs = [clone_for_grad(x) for x in (q, k, v, g, beta, lambda_q, lambda_k)]
