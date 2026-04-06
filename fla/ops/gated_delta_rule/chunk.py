@@ -1359,6 +1359,7 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         return dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0, None, None, None, None
 
 
+@torch.compiler.disable
 def chunk_gated_delta_rule_rank1_dc(
     q: torch.Tensor,
     k: torch.Tensor,
