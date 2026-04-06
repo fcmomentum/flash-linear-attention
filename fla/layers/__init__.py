@@ -26,6 +26,7 @@ from .mom import MomAttention
 from .multiscale_retention import MultiScaleRetention
 from .nsa import NativeSparseAttention
 from .path_attn import PaTHAttention
+from .phased_deltanet import PhasedDeltaNet
 from .rebased import ReBasedLinearAttention
 from .rodimus import RodimusAttention, SlidingWindowSharedKeyAttention
 from .rwkv6 import RWKV6Attention
@@ -57,6 +58,7 @@ __all__ = [
     'MultiScaleRetention',
     'NativeSparseAttention',
     'PaTHAttention',
+    'PhasedDeltaNet',
     'ReBasedLinearAttention',
     'RodimusAttention',
     'RWKV6Attention',
