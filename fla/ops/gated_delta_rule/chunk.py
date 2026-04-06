@@ -1449,7 +1449,7 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0, cu_seqlens)
         initial_state = (state0, bias_state0) if has_initial_state else None
         with torch.no_grad():
-            o, final_state, h_states, b_states = _dense_rank1_dc_forward_batched(
+            o, final_state, _, _ = _dense_rank1_dc_forward_batched(
                 q=q,
                 k=k,
                 v=v,
@@ -1461,8 +1461,6 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
                 initial_state=initial_state,
             )
             state, bias_state = final_state
-        ctx.h_states = h_states
-        ctx.b_states = b_states
         return o, state, bias_state
 
     @staticmethod
@@ -1473,6 +1471,18 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
         if dbias_state is None:
             dbias_state = None
         initial_state = (state0, bias_state0) if ctx.has_initial_state else None
+        with torch.no_grad():
+            _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
+                scale=ctx.scale,
+                initial_state=initial_state,
+            )
         dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
             q=q,
             k=k,
@@ -1482,8 +1492,8 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
             lambda_q=lambda_q,
             lambda_k=lambda_k,
             scale=ctx.scale,
-            h_states=ctx.h_states,
-            b_states=ctx.b_states,
+            h_states=h_states,
+            b_states=b_states,
             do=do,
             dstate=dstate,
             dbias_state=dbias_state,
