@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
-from fla.ops.gated_delta_rule.phase_utils import apply_nonphase_activation, build_fixed_rope_phase
+from fla.ops.gated_delta_rule.phase_utils import build_fixed_rope_phase, rotate_phase_channels
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_rank1_dc,
@@ -91,8 +91,8 @@ class GatedDeltaNet(nn.Module):
         norm_eps (float, Optional):
             The epsilon value for the normalization layer. Default: 1e-5.
         num_phase_channels (int, Optional):
-            Number of RoPE-style paired phase channels per head. Must be even and
-            at most `head_dim * expand_v`. Default: 0 (no phase channels).
+            Number of RoPE-style paired phase channels per key/query head. Must be
+            even and at most `head_dim`. Default: 0 (no phase channels).
     """
 
     def __init__(
@@ -143,13 +143,13 @@ class GatedDeltaNet(nn.Module):
         self.num_phase_channels = num_phase_channels if num_phase_channels is not None else 0
         if self.num_phase_channels < 0:
             raise ValueError("num_phase_channels must be non-negative.")
-        if self.num_phase_channels > self.head_v_dim:
+        if self.num_phase_channels > self.head_k_dim:
             raise ValueError(
-                f"num_phase_channels={self.num_phase_channels} exceeds head_v_dim={self.head_v_dim}.",
+                f"num_phase_channels={self.num_phase_channels} exceeds head_k_dim={self.head_k_dim}.",
             )
         if self.num_phase_channels % 2 != 0:
             raise ValueError("num_phase_channels must be even for RoPE-style rotations.")
-        self.num_nonphase_channels = self.head_v_dim - self.num_phase_channels
+        self.num_nonphase_channels = self.head_k_dim - self.num_phase_channels
 
         # Consistency check: Ensure expand_v produces integer values
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
@@ -286,24 +286,18 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
             )
-            v = apply_nonphase_activation(
-                v,
-                num_phase_channels=self.num_phase_channels,
-                head_v_dim=self.head_v_dim,
-                num_v_heads=self.num_v_heads,
-            )
+            v = F.silu(v)
         else:
             q = F.silu(self.q_proj(hidden_states))
             k = F.silu(self.k_proj(hidden_states))
-            v = apply_nonphase_activation(
-                self.v_proj(hidden_states),
-                num_phase_channels=self.num_phase_channels,
-                head_v_dim=self.head_v_dim,
-                num_v_heads=self.num_v_heads,
-            )
+            v = F.silu(self.v_proj(hidden_states))
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+
+        if self.num_v_heads > self.num_heads:
+            q, k = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads), (q, k))
+
         phase_offset = 0
         cache_position = kwargs.get('cache_position')
         if cache_position is not None:
@@ -313,21 +307,20 @@ class GatedDeltaNet(nn.Module):
                 phase_offset = int(cache_position)
         elif past_key_values is not None and attention_mask is None:
             phase_offset = int(past_key_values.get_seq_length())
-        phi = build_fixed_rope_phase(
+        qk_phase = build_fixed_rope_phase(
             inv_freq=self.phase_inv_freq,
-            batch_size=v.shape[0],
-            seq_len=v.shape[1],
-            num_heads=self.num_v_heads,
-            head_v_dim=self.head_v_dim,
+            batch_size=q.shape[0],
+            seq_len=q.shape[1],
+            num_heads=q.shape[2],
+            head_v_dim=self.head_k_dim,
             num_phase_channels=self.num_phase_channels,
-            device=v.device,
-            dtype=v.dtype,
+            device=q.device,
+            dtype=q.dtype,
             cu_seqlens=cu_seqlens,
             offset=phase_offset,
         )
-
-        if self.num_v_heads > self.num_heads:
-            q, k = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads), (q, k))
+        q = rotate_phase_channels(q, qk_phase, num_phase_channels=self.num_phase_channels)
+        k = rotate_phase_channels(k, qk_phase, num_phase_channels=self.num_phase_channels)
 
         beta = self.b_proj(hidden_states).sigmoid()
         if self.allow_neg_eigval:
@@ -360,8 +353,6 @@ class GatedDeltaNet(nn.Module):
                     output_final_state=use_cache,
                     cu_seqlens=cu_seqlens,
                     use_qk_l2norm_in_kernel=False,
-                    phase=phi,
-                    num_phase_channels=self.num_phase_channels,
                 )
             elif mode == 'chunk':
                 o, recurrent_state = chunk_gated_delta_rule_rank1_dc(
@@ -376,8 +367,6 @@ class GatedDeltaNet(nn.Module):
                     initial_state=recurrent_state,
                     output_final_state=use_cache,
                     cu_seqlens=cu_seqlens,
-                    phase=phi,
-                    num_phase_channels=self.num_phase_channels,
                 )
             else:
                 o, recurrent_state = naive_recurrent_gated_delta_rule_rank1_dc(
@@ -392,8 +381,6 @@ class GatedDeltaNet(nn.Module):
                     initial_state=recurrent_state,
                     output_final_state=use_cache,
                     cu_seqlens=cu_seqlens,
-                    phase=phi,
-                    num_phase_channels=self.num_phase_channels,
                 )
         elif mode == 'chunk':
             o, recurrent_state = chunk_gated_delta_rule(
@@ -406,8 +393,6 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
-                phase=phi,
-                num_phase_channels=self.num_phase_channels,
             )
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_gated_delta_rule(
@@ -420,8 +405,6 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
-                phase=phi,
-                num_phase_channels=self.num_phase_channels,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
