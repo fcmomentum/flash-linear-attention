@@ -883,6 +883,18 @@ class FusedRecurrentRank1DCFunction(torch.autograd.Function):
             dstate = None
         if dbias_state is not None and dbias_state.numel() == 0:
             dbias_state = None
+        with torch.no_grad():
+            _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
+                scale=ctx.scale,
+                initial_state=initial_state,
+            )
         if ctx.use_triton_backward:
             dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = fused_recurrent_gated_delta_rule_rank1_dc_bwd(
                 q=q,
@@ -897,23 +909,13 @@ class FusedRecurrentRank1DCFunction(torch.autograd.Function):
                 dbt=dbias_state,
                 scale=ctx.scale,
                 initial_state=initial_state,
+                h_states=h_states,
+                b_states=b_states,
                 cu_seqlens=None,
                 use_exp2=False,
                 transpose_state_layout=False,
             )
         else:
-            with torch.no_grad():
-                _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    lambda_q=lambda_q,
-                    lambda_k=lambda_k,
-                    scale=ctx.scale,
-                    initial_state=initial_state,
-                )
             dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
                 q=q,
                 k=k,
