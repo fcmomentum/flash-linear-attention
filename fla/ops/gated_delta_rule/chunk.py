@@ -17,7 +17,12 @@ from fla.ops.cp.chunk_delta_h import (
     expand_h0,
 )
 from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
-from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule, naive_recurrent_gated_delta_rule_rank1_dc
+from fla.ops.gated_delta_rule.naive import (
+    naive_chunk_gated_delta_rule_phase_transport,
+    naive_recurrent_gated_delta_rule,
+    naive_recurrent_gated_delta_rule_rank1_dc,
+)
+from fla.ops.gated_delta_rule.phase_utils import phase_prefix_sum, rotate_phase_channels
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
@@ -325,23 +330,35 @@ def chunk_gated_delta_rule(
     **kwargs,
 ):
     if phase is not None and num_phase_channels > 0:
-        warnings.warn(
-            "Phase-aware chunk_gated_delta_rule uses the dense recurrent reference path during training for now.",
-            stacklevel=2,
-        )
-        return naive_recurrent_gated_delta_rule(
+        if cp_context is not None:
+            raise NotImplementedError("Phase-aware chunk_gated_delta_rule does not support context parallelism yet.")
+        if scale is None:
+            scale = k.shape[-1] ** -0.5
+        phase_prefix, phase_total = phase_prefix_sum(phase, cu_seqlens=cu_seqlens)
+        transported_v = rotate_phase_channels(v, -phase_prefix, num_phase_channels=num_phase_channels)
+        o, final_state = ChunkGatedDeltaRuleFunction.apply(
             q=q,
             k=k,
-            v=v,
-            beta=beta,
+            v=transported_v,
             g=g,
+            beta=beta,
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            phase=phase,
-            num_phase_channels=num_phase_channels,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cp_context=cp_context,
+            transpose_state_layout=transpose_state_layout,
         )
+        o = rotate_phase_channels(o, phase_prefix, num_phase_channels=num_phase_channels)
+        if final_state is not None:
+            final_state = rotate_phase_channels(
+                final_state,
+                phase_total.unsqueeze(-2),
+                num_phase_channels=num_phase_channels,
+            )
+        return o, final_state
     r"""
     Args:
         q (torch.Tensor):

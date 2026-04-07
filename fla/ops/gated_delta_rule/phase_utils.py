@@ -41,3 +41,32 @@ def rotate_phase_channels(x: torch.Tensor, phase: torch.Tensor | None, *, num_ph
     if num_phase_channels == x.shape[-1]:
         return x_phase
     return torch.cat((x_phase, x[..., num_phase_channels:]), dim=-1)
+
+
+def phase_prefix_sum(
+    phase: torch.Tensor,
+    *,
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cu_seqlens is None:
+        phase_cumsum = phase.cumsum(dim=1)
+        phase_prefix = phase_cumsum - phase
+        phase_total = phase_cumsum[:, -1]
+        return phase_prefix, phase_total
+
+    if phase.shape[0] != 1:
+        raise ValueError("phase must have batch size 1 when cu_seqlens is provided.")
+
+    phase_prefix = torch.zeros_like(phase)
+    num_seqs = cu_seqlens.numel() - 1
+    phase_total = phase.new_zeros((num_seqs, phase.shape[2], phase.shape[3]))
+    for i in range(num_seqs):
+        start = int(cu_seqlens[i].item())
+        end = int(cu_seqlens[i + 1].item())
+        if end <= start:
+            continue
+        seq_phase = phase[:, start:end]
+        seq_cumsum = seq_phase.cumsum(dim=1)
+        phase_prefix[:, start:end] = seq_cumsum - seq_phase
+        phase_total[i] = seq_cumsum[0, -1]
+    return phase_prefix, phase_total
