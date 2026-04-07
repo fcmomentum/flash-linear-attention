@@ -857,16 +857,21 @@ class FusedRecurrentRank1DCFunction(torch.autograd.Function):
         ctx.use_triton_backward = _USE_TRITON_RANK1_DC_BACKWARD
         ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0)
         with torch.no_grad():
-            o, final_state, _, _ = _dense_rank1_dc_forward_batched(
+            o, final_state = fused_recurrent_gated_delta_rule_rank1_dc_fwd(
                 q=q,
                 k=k,
                 v=v,
-                g=g,
                 beta=beta,
+                g=g,
                 lambda_q=lambda_q,
                 lambda_k=lambda_k,
                 scale=scale,
                 initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=None,
+                use_exp2=False,
+                transpose_state_layout=False,
             )
         state, bias_state = final_state
         if not output_final_state:
