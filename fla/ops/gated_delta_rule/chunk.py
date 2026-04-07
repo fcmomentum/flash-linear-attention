@@ -17,6 +17,7 @@ from fla.ops.cp.chunk_delta_h import (
     expand_h0,
 )
 from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule, naive_recurrent_gated_delta_rule_rank1_dc
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
@@ -324,7 +325,23 @@ def chunk_gated_delta_rule(
     **kwargs,
 ):
     if phase is not None and num_phase_channels > 0:
-        raise NotImplementedError("Phase-aware chunk_gated_delta_rule is not implemented yet.")
+        warnings.warn(
+            "Phase-aware chunk_gated_delta_rule uses the dense recurrent reference path during training for now.",
+            stacklevel=2,
+        )
+        return naive_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            g=g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            phase=phase,
+            num_phase_channels=num_phase_channels,
+        )
     r"""
     Args:
         q (torch.Tensor):
@@ -1685,7 +1702,25 @@ def chunk_gated_delta_rule_rank1_dc(
     **kwargs,
 ):
     if phase is not None and num_phase_channels > 0:
-        raise NotImplementedError("Phase-aware chunk_gated_delta_rule_rank1_dc is not implemented yet.")
+        warnings.warn(
+            "Phase-aware chunk_gated_delta_rule_rank1_dc uses the dense recurrent reference path during training for now.",
+            stacklevel=2,
+        )
+        return naive_recurrent_gated_delta_rule_rank1_dc(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            lambda_q=lambda_q,
+            lambda_k=lambda_k,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            phase=phase,
+            num_phase_channels=num_phase_channels,
+        )
     orig_dtype = v.dtype
     if scale is None:
         scale = k.shape[-1] ** -0.5

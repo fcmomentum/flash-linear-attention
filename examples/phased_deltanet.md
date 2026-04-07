@@ -187,3 +187,150 @@ $$
 ---
 
 If you want the **signal/noise SNR expression for this exact phased model**, I can also write it in the same paper's notation — with explicit $d_k$ and $D$ dependencies spelled out.
+
+---
+
+# Design Note: Training-Quality Kernelization
+
+The current implementation status is split into three pieces:
+
+1. A reference phased recurrence exists and is differentiable.
+2. A fused recurrent Triton forward path exists for the RoPE-style phased update.
+3. A true chunk Triton training path does **not** exist yet.
+
+That last point is the blocker for training-quality performance.
+
+## 1. Why Chunk Is Harder Than Fused Recurrent
+
+For the plain Gated DeltaNet chunk rule, the kernelization works because each chunk can be summarized through the usual WY-style decomposition:
+
+$$
+S_t = \alpha_t S_{t-1} + \delta_t k_t^\top,
+\qquad
+\delta_t = \beta_t \left(v_t - S_{t-1} k_t\right).
+$$
+
+Inside a chunk, this leads to the familiar lower-triangular system over token interactions, and the implementation can factor the chunk through the intermediate objects
+
+$$
+A,\; w,\; u,\; h,\; o.
+$$
+
+The phased recurrence changes the state transition itself:
+
+$$
+S_t = \alpha_t R(\phi_t) S_{t-1} + \delta_t k_t^\top,
+\qquad
+\delta_t = \beta_t \left(R(\psi_t) v_t - S_{t-1} k_t\right),
+$$
+
+with RoPE-style real rotations $R(\cdot)$ applied only on the designated phase channels.
+
+So the phase is not just an output decoration. It changes the linear operator that maps one state to the next.
+
+## 2. Why the Existing Chunk Derivation Cannot Be Reused As-Is
+
+The current chunk kernels assume that the cross-token coupling inside a chunk is driven only by:
+
+1. scalar decays $\alpha_t$ / $g_t$,
+2. feature vectors $k_t$,
+3. write strengths $\beta_t$.
+
+With phase, each step also applies a token-dependent rotation on the value/state subspace. That means:
+
+1. the state carried between chunk positions is no longer updated by a pure scalar decay,
+2. the effective contribution of an earlier write at time $\tau$ to a later time $t$ includes a product of rotations,
+3. the chunk-local triangular system is now expressed in a rotated basis that changes with token position.
+
+In particular, the current `A = beta * K K^T` style derivation is no longer the right internal object, because the value-space transport between two positions is not identity; it is the accumulated rotation between them.
+
+## 3. The Right Way To Re-Derive Chunk Phase Kernels
+
+The clean way to recover a chunk factorization is to move to a transformed frame.
+
+Define the cumulative phase transport
+
+$$
+P_t := \prod_{u=1}^t R(\phi_u).
+$$
+
+Then define a transported state
+
+$$
+\widetilde S_t := P_t^{-1} S_t.
+$$
+
+Substituting into the phased recurrence gives
+
+$$
+\widetilde S_t
+=
+\alpha_t \widetilde S_{t-1}
++
+\widetilde \delta_t k_t^\top,
+$$
+
+where the write term is expressed in the transported frame:
+
+$$
+\widetilde \delta_t
+=
+\beta_t \left(P_t^{-1} R(\psi_t) v_t - \widetilde S_{t-1} k_t\right).
+$$
+
+This is the key observation:
+
+1. in the transported frame, the state-to-state transition returns to the ordinary scalar-decay DeltaNet form;
+2. all phase complexity is pushed into the transported values
+   $$
+   \widetilde v_t := P_t^{-1} R(\psi_t) v_t;
+   $$
+3. the readout must also be transported consistently:
+   $$
+   y_t = P_t \left(\widetilde S_t q_t\right)
+   $$
+   or, more generally, use the appropriate demodulated read vector in the transported frame.
+
+This suggests a chunk strategy:
+
+1. compute cumulative phase transport per token,
+2. rotate values into the transported frame before the chunk solve,
+3. run the existing DeltaNet chunk algebra in that transported frame,
+4. rotate outputs back at readout,
+5. propagate chunk boundary states in transported coordinates.
+
+## 4. Consequences for the Triton Implementation
+
+A real chunk Triton phase implementation therefore needs updates in all of these places:
+
+1. `chunk_fwd.py`
+   The chunk-local triangular solve must consume transported values rather than raw values.
+2. `common/chunk_delta_h.py`
+   The hidden-state propagation across chunk boundaries must carry the transported state, not the raw rotated state.
+3. `common/chunk_o.py`
+   The readout must apply the inverse transport required to map chunk-frame outputs back to the model frame.
+4. backward kernels
+   Gradients must flow through cumulative phase transport, which means the backward pass must differentiate both the transport and the transported-frame DeltaNet algebra.
+
+This is why a correct Triton chunk backward is a re-derivation task, not a small patch.
+
+## 5. Practical Implementation Plan
+
+The practical path to training-quality chunk kernels is:
+
+1. Keep the dense recurrent reference as the correctness oracle.
+2. Implement a transported-frame chunk forward in Python first.
+3. Verify that transported-frame chunk forward matches the dense phased recurrence.
+4. Port that transported-frame chunk forward to Triton.
+5. Implement the transported-frame backward, either by:
+   1. saving transported intermediates, or
+   2. recomputing transport and chunk-local quantities in backward.
+6. Replace the temporary dense fallback only after the transported-frame chunk forward/backward matches the reference.
+
+## 6. Current Recommendation
+
+Until the transported-frame chunk derivation is implemented, phase-enabled training should be treated as:
+
+1. correct through the dense recurrent fallback,
+2. partially accelerated for fused recurrent forward,
+3. not yet training-quality from a chunk-kernel performance standpoint.

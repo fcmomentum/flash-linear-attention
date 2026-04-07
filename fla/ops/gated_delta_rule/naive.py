@@ -15,19 +15,24 @@ def _run_recurrent_gated_delta_rule_single_sequence(
     g: torch.Tensor,
     scale: float,
     h: torch.Tensor,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
 ):
     H, T, K = q.shape
     V = v.shape[-1]
     o = torch.zeros(H, T, V, device=v.device, dtype=torch.float32)
 
     for i in range(T):
+        phase_i = None if phase is None else phase[i]
         b_q = q[:, i]
         b_k = k[:, i]
-        b_v = v[:, i]
+        b_v = rotate_phase_channels(v[:, i], phase_i, num_phase_channels=num_phase_channels)
+        h = rotate_phase_channels(h, phase_i, num_phase_channels=num_phase_channels)
         h = h * g[:, i].exp()[:, None, None]
         delta = beta[:, i, None] * (b_v - (h * b_k[..., None]).sum(-2))
         h = h + b_k.unsqueeze(-1) * delta.unsqueeze(-2)
-        o[:, i] = torch.einsum('hk,hkv->hv', b_q * scale, h)
+        h_out = rotate_phase_channels(h, None if phase_i is None else -phase_i, num_phase_channels=num_phase_channels)
+        o[:, i] = torch.einsum('hk,hkv->hv', b_q * scale, h_out)
     return o, h
 
 
@@ -40,6 +45,9 @@ def naive_recurrent_gated_delta_rule(
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
 ):
     """
     Reference PyTorch implementation of recurrent gated delta rule.
@@ -59,31 +67,77 @@ def naive_recurrent_gated_delta_rule(
         final_state: [B, H, K, V] if output_final_state else None
     """
     orig_dtype = v.dtype
-    q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g])
-    B, H, T, K, V = *k.shape, v.shape[-1]
+    q, k, v, beta, g = map(lambda x: x.to(torch.float32), [q, k, v, beta, g])
+    if phase is not None:
+        phase = phase.to(torch.float32)
     if scale is None:
         scale = q.shape[-1] ** -0.5
 
-    o = torch.zeros(B, H, T, V, device=v.device, dtype=torch.float32)
-    h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
-    if initial_state is not None:
-        h = initial_state.to(torch.float32)
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError("Expected batch size 1 when `cu_seqlens` is provided.")
+        total = q.shape[1]
+        H, K, V = q.shape[2], q.shape[3], v.shape[-1]
+        num_seq = len(cu_seqlens) - 1
+        init_h = torch.zeros(num_seq, H, K, V, device=v.device, dtype=torch.float32)
+        if initial_state is not None:
+            init_h = initial_state.to(torch.float32).clone()
+        o_segments = []
+        h_segments = []
+        for n in range(num_seq):
+            bos = int(cu_seqlens[n].item())
+            eos = int(cu_seqlens[n + 1].item())
+            q_n = q[0, bos:eos].transpose(0, 1).contiguous()
+            k_n = k[0, bos:eos].transpose(0, 1).contiguous()
+            v_n = v[0, bos:eos].transpose(0, 1).contiguous()
+            beta_n = beta[0, bos:eos].transpose(0, 1).contiguous()
+            g_n = g[0, bos:eos].transpose(0, 1).contiguous()
+            phase_n = None if phase is None else phase[0, bos:eos]
+            o_n, h_n = _run_recurrent_gated_delta_rule_single_sequence(
+                q=q_n,
+                k=k_n,
+                v=v_n,
+                beta=beta_n,
+                g=g_n,
+                scale=scale,
+                h=init_h[n],
+                phase=phase_n,
+                num_phase_channels=num_phase_channels,
+            )
+            o_segments.append(o_n.transpose(0, 1))
+            h_segments.append(h_n)
+        o = torch.zeros(1, total, H, V, device=v.device, dtype=torch.float32)
+        for n in range(num_seq):
+            bos = int(cu_seqlens[n].item())
+            eos = int(cu_seqlens[n + 1].item())
+            o[0, bos:eos] = o_segments[n]
+        h = torch.stack(h_segments, dim=0)
+    else:
+        q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous(), [q, k, v, beta, g])
+        B, H, T, K, V = *k.shape, v.shape[-1]
+        o = torch.zeros(B, H, T, V, device=v.device, dtype=torch.float32)
+        h = torch.zeros(B, H, K, V, device=v.device, dtype=torch.float32)
+        if initial_state is not None:
+            h = initial_state.to(torch.float32)
 
-    for b in range(B):
-        o[b], h[b] = _run_recurrent_gated_delta_rule_single_sequence(
-            q=q[b],
-            k=k[b],
-            v=v[b],
-            beta=beta[b],
-            g=g[b],
-            scale=scale,
-            h=h[b],
-        )
+        for b in range(B):
+            phase_b = None if phase is None else phase[b]
+            o[b], h[b] = _run_recurrent_gated_delta_rule_single_sequence(
+                q=q[b],
+                k=k[b],
+                v=v[b],
+                beta=beta[b],
+                g=g[b],
+                scale=scale,
+                h=h[b],
+                phase=phase_b,
+                num_phase_channels=num_phase_channels,
+            )
+        o = o.transpose(1, 2).contiguous()
 
     if not output_final_state:
         h = None
-    o = o.transpose(1, 2).contiguous().to(orig_dtype)
-    return o, h
+    return o.to(orig_dtype), h
 
 
 def _run_rank1_dc_single_sequence(
@@ -359,3 +413,86 @@ def naive_chunk_gated_delta_rule(
     o = o[:, :, :T]
     o = o.transpose(1, 2)
     return o, S
+
+
+def _phase_prefix_sum(phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    phase_cumsum = phase.cumsum(dim=1)
+    phase_prefix = phase_cumsum - phase
+    phase_total = phase_cumsum[:, -1]
+    return phase_prefix, phase_total
+
+
+def naive_chunk_gated_delta_rule_phase_transport(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    phase: torch.Tensor,
+    num_phase_channels: int,
+    chunk_size: int = 64,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+):
+    """
+    Prototype chunk forward for the simplified phased DeltaNet used by GatedDeltaNet.
+
+    The recurrence is rewritten in a transported frame where the per-step phase
+    transport is removed from the state transition, values are rotated into that
+    frame with the prefix phase, the ordinary chunk rule is applied, and outputs
+    are rotated back to the model frame.
+    """
+    if num_phase_channels == 0:
+        return naive_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            chunk_size=chunk_size,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+
+    if phase is None:
+        raise ValueError("phase must be provided when num_phase_channels > 0.")
+
+    orig_dtype = v.dtype
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    v = v.to(torch.float32)
+    g = g.to(torch.float32)
+    beta = beta.to(torch.float32)
+    phase = phase.to(torch.float32)
+
+    phase_prefix, phase_total = _phase_prefix_sum(phase)
+    v_tilde = rotate_phase_channels(v, -phase_prefix, num_phase_channels=num_phase_channels)
+
+    transported_state0 = None
+    if initial_state is not None:
+        transported_state0 = initial_state.to(torch.float32)
+
+    o_tilde, transported_state = naive_chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v_tilde,
+        g=g,
+        beta=beta,
+        chunk_size=chunk_size,
+        scale=scale,
+        initial_state=transported_state0,
+        output_final_state=output_final_state,
+    )
+    o = rotate_phase_channels(o_tilde.to(torch.float32), phase_prefix, num_phase_channels=num_phase_channels)
+
+    if not output_final_state:
+        return o.to(orig_dtype), None
+
+    final_state = rotate_phase_channels(
+        transported_state.to(torch.float32),
+        phase_total.unsqueeze(-2),
+        num_phase_channels=num_phase_channels,
+    )
+    return o.to(orig_dtype), final_state.to(orig_dtype)

@@ -249,8 +249,6 @@ class GatedDeltaNet(nn.Module):
         mode = 'fused_recurrent' if (q_len <= 64 and not self.training) else self.mode
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
-        if self.num_phase_channels > 0 and mode == 'chunk':
-            raise NotImplementedError("Phase-aware GatedDeltaNet currently supports fused_recurrent mode only.")
 
         last_state = get_layer_cache(self, past_key_values)
 
