@@ -70,3 +70,42 @@ def phase_prefix_sum(
         phase_prefix[:, start:end] = seq_cumsum - seq_phase
         phase_total[i] = seq_cumsum[0, -1]
     return phase_prefix, phase_total
+
+
+def build_fixed_rope_phase(
+    *,
+    inv_freq: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_v_dim: int,
+    num_phase_channels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    cu_seqlens: torch.LongTensor | None = None,
+    offset: int = 0,
+) -> torch.Tensor | None:
+    if num_phase_channels == 0:
+        return None
+
+    pair_dim = num_phase_channels // 2
+    inv_freq = inv_freq[:pair_dim].to(device=device)
+
+    if cu_seqlens is None:
+        positions = torch.arange(offset, offset + seq_len, device=device, dtype=inv_freq.dtype)
+    else:
+        if batch_size != 1:
+            raise ValueError("cu_seqlens with fixed rope phase requires batch_size == 1.")
+        positions = torch.empty(seq_len, device=device, dtype=inv_freq.dtype)
+        num_sequences = cu_seqlens.numel() - 1
+        for i in range(num_sequences):
+            start = int(cu_seqlens[i].item())
+            end = int(cu_seqlens[i + 1].item())
+            if end <= start:
+                continue
+            positions[start:end] = torch.arange(end - start, device=device, dtype=inv_freq.dtype)
+
+    freqs = torch.outer(positions, inv_freq).to(dtype)
+    phase = torch.zeros(batch_size, seq_len, num_heads, head_v_dim, device=device, dtype=dtype)
+    phase[..., :num_phase_channels:2] = freqs.unsqueeze(0).unsqueeze(2)
+    return phase

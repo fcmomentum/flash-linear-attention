@@ -12,6 +12,7 @@ from einops import rearrange
 
 from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
+from fla.ops.gated_delta_rule.phase_utils import build_fixed_rope_phase
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -44,6 +45,7 @@ class PhasedDeltaNet(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        phase_base: float = 10000.0,
         **kwargs,
     ) -> PhasedDeltaNet:
         super().__init__()
@@ -62,6 +64,7 @@ class PhasedDeltaNet(nn.Module):
         self.num_phase_channels = num_phase_channels if num_phase_channels is not None else self.head_v_dim
         self.num_nonphase_channels = self.head_v_dim - self.num_phase_channels
         self.layer_idx = layer_idx
+        self.phase_base = phase_base
 
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
             raise ValueError(
@@ -86,7 +89,12 @@ class PhasedDeltaNet(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.a_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
-        self.phi_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
+        phase_inv_freq = torch.empty(self.num_phase_channels // 2, dtype=torch.float32)
+        if self.num_phase_channels > 0:
+            phase_inv_freq = 1.0 / (
+                phase_base ** (torch.arange(0, self.num_phase_channels, 2, dtype=torch.float32) / self.num_phase_channels)
+            )
+        self.register_buffer("phase_inv_freq", phase_inv_freq, persistent=False)
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
@@ -299,10 +307,29 @@ class PhasedDeltaNet(nn.Module):
         theta = rearrange(theta, '... (h d) -> ... h d', d=self.head_v_dim)
         psi = rearrange(psi, '... (h d) -> ... h d', d=self.head_v_dim)
         value = rearrange(value, '... (h d) -> ... h d', d=self.head_v_dim)
-        phi = rearrange(self.phi_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
+        phase_offset = 0
+        cache_position = kwargs.get('cache_position')
+        if cache_position is not None:
+            if torch.is_tensor(cache_position):
+                phase_offset = int(cache_position.reshape(-1)[0].item())
+            else:
+                phase_offset = int(cache_position)
+        elif past_key_values is not None and attention_mask is None:
+            phase_offset = int(past_key_values.get_seq_length())
+        phi = build_fixed_rope_phase(
+            inv_freq=self.phase_inv_freq,
+            batch_size=value.shape[0],
+            seq_len=value.shape[1],
+            num_heads=self.num_v_heads,
+            head_v_dim=self.head_v_dim,
+            num_phase_channels=self.num_phase_channels,
+            device=value.device,
+            dtype=value.dtype,
+            cu_seqlens=cu_seqlens,
+            offset=phase_offset,
+        )
         theta = self._restrict_phase_channels(theta)
         psi = self._restrict_phase_channels(psi)
-        phi = self._restrict_phase_channels(phi)
         alpha = torch.exp(-torch.nn.functional.softplus(self.a_proj(hidden_states).float())).to(value.dtype)
         beta = self.b_proj(hidden_states).float().sigmoid().to(value.dtype)
 

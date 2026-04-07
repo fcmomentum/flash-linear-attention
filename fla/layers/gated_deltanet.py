@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
-from fla.ops.gated_delta_rule.phase_utils import apply_nonphase_activation, restrict_phase_channels
+from fla.ops.gated_delta_rule.phase_utils import apply_nonphase_activation, build_fixed_rope_phase
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_rank1_dc,
@@ -113,6 +113,7 @@ class GatedDeltaNet(nn.Module):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         num_phase_channels: int | None = 0,
+        phase_base: float = 10000.0,
         **kwargs,
     ) -> GatedDeltaNet:
         super().__init__()
@@ -138,6 +139,7 @@ class GatedDeltaNet(nn.Module):
         self.key_dim = int(self.num_heads * self.head_k_dim)
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
         self.layer_idx = layer_idx
+        self.phase_base = phase_base
         self.num_phase_channels = num_phase_channels if num_phase_channels is not None else 0
         if self.num_phase_channels < 0:
             raise ValueError("num_phase_channels must be non-negative.")
@@ -172,7 +174,12 @@ class GatedDeltaNet(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.a_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
-        self.phi_proj = nn.Linear(hidden_size, self.value_dim, bias=False) if self.num_phase_channels > 0 else None
+        phase_inv_freq = torch.empty(self.num_phase_channels // 2, dtype=torch.float32)
+        if self.num_phase_channels > 0:
+            phase_inv_freq = 1.0 / (
+                phase_base ** (torch.arange(0, self.num_phase_channels, 2, dtype=torch.float32) / self.num_phase_channels)
+            )
+        self.register_buffer("phase_inv_freq", phase_inv_freq, persistent=False)
 
         A = torch.empty(self.num_v_heads, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -297,10 +304,27 @@ class GatedDeltaNet(nn.Module):
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
-        phi = None
-        if self.phi_proj is not None:
-            phi = rearrange(self.phi_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
-            phi = restrict_phase_channels(phi, num_phase_channels=self.num_phase_channels)
+        phase_offset = 0
+        cache_position = kwargs.get('cache_position')
+        if cache_position is not None:
+            if torch.is_tensor(cache_position):
+                phase_offset = int(cache_position.reshape(-1)[0].item())
+            else:
+                phase_offset = int(cache_position)
+        elif past_key_values is not None and attention_mask is None:
+            phase_offset = int(past_key_values.get_seq_length())
+        phi = build_fixed_rope_phase(
+            inv_freq=self.phase_inv_freq,
+            batch_size=v.shape[0],
+            seq_len=v.shape[1],
+            num_heads=self.num_v_heads,
+            head_v_dim=self.head_v_dim,
+            num_phase_channels=self.num_phase_channels,
+            device=v.device,
+            dtype=v.dtype,
+            cu_seqlens=cu_seqlens,
+            offset=phase_offset,
+        )
 
         if self.num_v_heads > self.num_heads:
             q, k = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads), (q, k))
