@@ -337,19 +337,19 @@ def chunk_gated_delta_rule(
         phase_prefix, phase_total = phase_prefix_sum(phase, cu_seqlens=cu_seqlens)
         transported_v = rotate_phase_channels(v, -phase_prefix, num_phase_channels=num_phase_channels)
         o, final_state = ChunkGatedDeltaRuleFunction.apply(
-            q=q,
-            k=k,
-            v=transported_v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            cp_context=cp_context,
-            transpose_state_layout=transpose_state_layout,
+            q,
+            k,
+            transported_v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            use_qk_l2norm_in_kernel,
+            cp_context,
+            transpose_state_layout,
         )
         o = rotate_phase_channels(o, phase_prefix, num_phase_channels=num_phase_channels)
         if final_state is not None:
