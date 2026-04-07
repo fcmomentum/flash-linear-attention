@@ -1549,7 +1549,10 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do: torch.Tensor, dstate: torch.Tensor, dbias_state: torch.Tensor):
-        from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_rank1_dc
+        from fla.ops.gated_delta_rule.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_rank1_dc_bwd,
+            fused_recurrent_gated_delta_rule_rank1_dc_fwd,
+        )
 
         q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0, cu_seqlens = ctx.saved_tensors
         if dstate is None:
@@ -1586,61 +1589,65 @@ class ChunkGatedDeltaRuleRank1DCFunction(torch.autograd.Function):
             start = chunk_idx * ctx.chunk_size
             end = min(start + ctx.chunk_size, seq_len)
             chunk_initial_state = boundary_states[chunk_idx]
-            with torch.enable_grad():
-                q_i = q[:, start:end].detach().requires_grad_(q.requires_grad)
-                k_i = k[:, start:end].detach().requires_grad_(k.requires_grad)
-                v_i = v[:, start:end].detach().requires_grad_(v.requires_grad)
-                g_i = g[:, start:end].detach().requires_grad_(g.requires_grad)
-                beta_i = beta[:, start:end].detach().requires_grad_(beta.requires_grad)
-                lambda_q_i = lambda_q[:, start:end].detach().requires_grad_(lambda_q.requires_grad)
-                lambda_k_i = lambda_k[:, start:end].detach().requires_grad_(lambda_k.requires_grad)
-                if chunk_initial_state is None:
-                    state_i = None
-                    bias_i = None
-                    grad_inputs = [q_i, k_i, v_i, g_i, beta_i, lambda_q_i, lambda_k_i]
-                else:
-                    state_i = chunk_initial_state[0].detach().requires_grad_(ctx.has_initial_state)
-                    bias_i = chunk_initial_state[1].detach().requires_grad_(ctx.has_initial_state)
-                    grad_inputs = [q_i, k_i, v_i, g_i, beta_i, lambda_q_i, lambda_k_i, state_i, bias_i]
-                out_i, final_state_i = fused_recurrent_gated_delta_rule_rank1_dc(
-                    q=q_i,
-                    k=k_i,
-                    v=v_i,
-                    g=g_i,
-                    beta=beta_i,
-                    lambda_q=lambda_q_i,
-                    lambda_k=lambda_k_i,
+            with torch.no_grad():
+                out_i, final_state_i = fused_recurrent_gated_delta_rule_rank1_dc_fwd(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    lambda_q=lambda_q[:, start:end],
+                    lambda_k=lambda_k[:, start:end],
                     scale=ctx.scale,
-                    initial_state=None if chunk_initial_state is None else (state_i, bias_i),
+                    initial_state=chunk_initial_state,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=False,
                     cu_seqlens=None,
                     use_exp2=False,
                     transpose_state_layout=False,
                 )
-                grad_h = dh if dh is not None else torch.zeros_like(final_state_i[0])
-                grad_b = db if db is not None else torch.zeros_like(final_state_i[1])
-                grad_outputs = [do[:, start:end], grad_h, grad_b]
-                grads = torch.autograd.grad(
-                    outputs=[out_i, final_state_i[0], final_state_i[1]],
-                    inputs=grad_inputs,
-                    grad_outputs=grad_outputs,
-                    allow_unused=False,
-                    retain_graph=False,
+                _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    lambda_q=lambda_q[:, start:end],
+                    lambda_k=lambda_k[:, start:end],
+                    scale=ctx.scale,
+                    initial_state=chunk_initial_state,
                 )
-            dq[:, start:end] = grads[0].to(torch.float32)
-            dk[:, start:end] = grads[1].to(torch.float32)
-            dv[:, start:end] = grads[2].to(torch.float32)
-            dg[:, start:end] = grads[3].to(torch.float32)
-            dbeta[:, start:end] = grads[4].to(torch.float32)
-            dlambda_q[:, start:end] = grads[5].to(torch.float32)
-            dlambda_k[:, start:end] = grads[6].to(torch.float32)
+            grad_h = dh if dh is not None else torch.zeros_like(final_state_i[0])
+            grad_b = db if db is not None else torch.zeros_like(final_state_i[1])
+            dq_i, dk_i, dv_i, dg_i, dbeta_i, dlambda_q_i, dlambda_k_i, dh, db = fused_recurrent_gated_delta_rule_rank1_dc_bwd(
+                q=q[:, start:end],
+                k=k[:, start:end],
+                v=v[:, start:end],
+                g=g[:, start:end],
+                beta=beta[:, start:end],
+                lambda_q=lambda_q[:, start:end],
+                lambda_k=lambda_k[:, start:end],
+                do=do[:, start:end],
+                dht=grad_h,
+                dbt=grad_b,
+                scale=ctx.scale,
+                initial_state=chunk_initial_state,
+                h_states=h_states,
+                b_states=b_states,
+                cu_seqlens=None,
+                use_exp2=False,
+                transpose_state_layout=False,
+            )
+            dq[:, start:end] = dq_i.to(torch.float32)
+            dk[:, start:end] = dk_i.to(torch.float32)
+            dv[:, start:end] = dv_i.to(torch.float32)
+            dg[:, start:end] = dg_i.to(torch.float32)
+            dbeta[:, start:end] = dbeta_i.to(torch.float32)
+            dlambda_q[:, start:end] = dlambda_q_i.to(torch.float32)
+            dlambda_k[:, start:end] = dlambda_k_i.to(torch.float32)
             if chunk_initial_state is None:
                 dh = None
                 db = None
-            else:
-                dh = grads[7].to(torch.float32)
-                db = grads[8].to(torch.float32)
         dstate0, dbias0 = dh, db
         dq = dq.to(q.dtype)
         dk = dk.to(k.dtype)
