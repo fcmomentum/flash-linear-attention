@@ -93,6 +93,9 @@ class GatedDeltaNet(nn.Module):
         num_phase_channels (int, Optional):
             Number of RoPE-style paired phase channels per key/query head. Must be
             even and at most `head_dim`. Default: 0 (no phase channels).
+        qk_nonphase_activation_only (bool, Optional):
+            If `True`, apply the q/k activation only to non-phase channels and
+            leave phase channels linear before RoPE. Default: `False`.
     """
 
     def __init__(
@@ -113,6 +116,7 @@ class GatedDeltaNet(nn.Module):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         num_phase_channels: int | None = 0,
+        qk_nonphase_activation_only: bool = False,
         phase_base: float = 10000.0,
         **kwargs,
     ) -> GatedDeltaNet:
@@ -141,6 +145,7 @@ class GatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.phase_base = phase_base
         self.num_phase_channels = num_phase_channels if num_phase_channels is not None else 0
+        self.qk_nonphase_activation_only = qk_nonphase_activation_only
         if self.num_phase_channels < 0:
             raise ValueError("num_phase_channels must be non-negative.")
         if self.num_phase_channels > self.head_k_dim:
@@ -206,13 +211,13 @@ class GatedDeltaNet(nn.Module):
                 hidden_size=self.key_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu',
+                activation=None,
             )
             self.k_conv1d = ShortConvolution(
                 hidden_size=self.key_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu',
+                activation=None,
             )
             self.v_conv1d = ShortConvolution(
                 hidden_size=self.value_dim,
@@ -234,6 +239,17 @@ class GatedDeltaNet(nn.Module):
 
         if self.use_rank1_dc_removal:
             self.dc_removal_nu_logit = nn.Parameter(torch.zeros(self.num_v_heads, self.head_k_dim))
+
+    def _apply_qk_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.qk_nonphase_activation_only or self.num_phase_channels == 0:
+            return F.silu(x)
+
+        x = rearrange(x, '... (h d) -> ... h d', h=self.num_heads, d=self.head_k_dim)
+        if self.num_phase_channels == self.head_k_dim:
+            x_out = x
+        else:
+            x_out = torch.cat((x[..., :self.num_phase_channels], F.silu(x[..., self.num_phase_channels:])), dim=-1)
+        return rearrange(x_out, '... h d -> ... (h d)')
 
     def forward(
         self,
@@ -286,10 +302,12 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
             )
+            q = self._apply_qk_activation(q)
+            k = self._apply_qk_activation(k)
             v = F.silu(v)
         else:
-            q = F.silu(self.q_proj(hidden_states))
-            k = F.silu(self.k_proj(hidden_states))
+            q = self._apply_qk_activation(self.q_proj(hidden_states))
+            k = self._apply_qk_activation(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
