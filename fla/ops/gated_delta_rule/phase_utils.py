@@ -30,6 +30,8 @@ def rotate_phase_channels(x: torch.Tensor, phase: torch.Tensor | None, *, num_ph
     # shape assumptions: phase[...] broadcasts to x[..., :num_phase_channels]
     x_phase = x[..., :num_phase_channels]
     phase_pairs = phase[..., :num_phase_channels:2]
+    while phase_pairs.ndim < x_phase.ndim:
+        phase_pairs = phase_pairs.unsqueeze(-2)
     cos = phase_pairs.float().cos().to(x.dtype).repeat_interleave(2, dim=-1)
     sin = phase_pairs.float().sin().to(x.dtype).repeat_interleave(2, dim=-1)
     x_even = x_phase[..., ::2]
