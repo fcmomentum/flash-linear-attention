@@ -13,10 +13,30 @@ from fla.utils import input_guard
 _USE_TRITON_RANK1_DC_BACKWARD = os.environ.get("FLA_USE_TRITON_RANK1_DC_BWD", "0") == "1"
 
 
+@triton.jit
+def _rotate_phase_vec(x, phase, offsets, num_phase_channels):
+    pair_offsets = tl.where((offsets & 1) == 0, offsets + 1, offsets - 1)
+    pair_x = x[pair_offsets]
+    base_offsets = offsets - (offsets & 1)
+    pair_phase = phase[base_offsets]
+    cos = tl.cos(pair_phase)
+    sin = tl.sin(pair_phase)
+    rot = tl.where((offsets & 1) == 0, -pair_x, pair_x)
+    use_phase = offsets < num_phase_channels
+    return tl.where(use_phase, x * cos + rot * sin, x)
+
+
+@triton.jit
+def _rotate_phase_state(b_h, phase, offsets, num_phase_channels, transpose_state: tl.constexpr):
+    rotated = _rotate_phase_vec(b_h if transpose_state else b_h.T, phase, offsets, num_phase_channels)
+    return rotated if transpose_state else rotated.T
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_GK': lambda args: args['gk'] is not None,
     'USE_GV': lambda args: args['gv'] is not None,
+    'USE_PHASE': lambda args: args['phase'] is not None and args['num_phase_channels'] > 0,
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -30,11 +50,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     gk,
     gv,
     beta,
+    phase,
     o,
     h0,
     ht,
     cu_seqlens,
     scale,
+    num_phase_channels,
     T,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -45,6 +67,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_GV: tl.constexpr,
+    USE_PHASE: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_BETA_HEADWISE: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -74,6 +97,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_gk = gk + (bos * HV + i_hv) * K + o_k
     if USE_GV:
         p_gv = gv + (bos * HV + i_hv) * V + o_v
+    if USE_PHASE:
+        p_phase = phase + (bos * HV + i_hv) * V + o_v
     if IS_BETA_HEADWISE:
         p_beta = beta + bos * HV + i_hv
     else:
@@ -103,6 +128,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        if USE_PHASE:
+            b_phase = tl.load(p_phase, mask=mask_v, other=0).to(tl.float32)
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
             b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
@@ -144,6 +171,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                     b_h *= exp(b_gv[:, None])
                 else:
                     b_h *= exp(b_gv[None, :])
+        if USE_PHASE:
+            b_h = _rotate_phase_state(b_h, b_phase, o_v, num_phase_channels, TRANSPOSE_STATE)
+            b_v = _rotate_phase_vec(b_v, b_phase, o_v, num_phase_channels)
 
         if TRANSPOSE_STATE:
             b_v = b_beta * (b_v - tl.sum(b_h * b_k[None, :], 1))
@@ -153,6 +183,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
             b_h += b_k[:, None] * b_v
             b_o = tl.sum(b_h * b_q[:, None], 0)
+        if USE_PHASE:
+            b_o = _rotate_phase_vec(b_o, -b_phase, o_v, num_phase_channels)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         p_q += H*K
@@ -164,6 +196,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             p_gk += HV*K
         if USE_GV:
             p_gv += HV*V
+        if USE_PHASE:
+            p_phase += HV*V
         p_beta += HV * (1 if IS_BETA_HEADWISE else V)
         p_o += HV*V
 
@@ -177,6 +211,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
+    'USE_PHASE': lambda args: args['phase'] is not None and args['num_phase_channels'] > 0,
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'USE_INITIAL_BIAS_STATE': lambda args: args['b0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
@@ -190,6 +225,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
     v,
     g,
     beta,
+    phase,
     lambda_q,
     lambda_k,
     o,
@@ -199,6 +235,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
     bt,
     cu_seqlens,
     scale,
+    num_phase_channels,
     T,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -207,6 +244,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_PHASE: tl.constexpr,
     IS_BETA_HEADWISE: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -232,6 +270,8 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
     p_q = q + (bos * H + i_h) * K + o_k
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
+    if USE_PHASE:
+        p_phase = phase + (bos * HV + i_hv) * V + o_v
     p_lambda_q = lambda_q + bos * HV + i_hv
     p_lambda_k = lambda_k + bos * HV + i_hv
     if USE_G:
@@ -270,6 +310,8 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        if USE_PHASE:
+            b_phase = tl.load(p_phase, mask=mask_v, other=0).to(tl.float32)
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
             b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
@@ -289,6 +331,10 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
                 decay = exp(b_g)
             b_b *= decay
             b_h *= decay
+        if USE_PHASE:
+            b_h = _rotate_phase_state(b_h, b_phase, o_v, num_phase_channels, TRANSPOSE_STATE)
+            b_b = _rotate_phase_vec(b_b, b_phase, o_v, num_phase_channels)
+            b_v = _rotate_phase_vec(b_v, b_phase, o_v, num_phase_channels)
 
         if TRANSPOSE_STATE:
             pred = tl.sum(b_h * b_k[None, :], 1) - b_lambda_k * b_b
@@ -302,11 +348,15 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
             b_h += b_k[:, None] * b_delta[None, :]
             b_b += b_delta
             b_o = tl.sum(b_h * b_q[:, None], 0) - b_lambda_q * b_b
+        if USE_PHASE:
+            b_o = _rotate_phase_vec(b_o, -b_phase, o_v, num_phase_channels)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         p_q += H * K
         p_k += H * K
         p_v += HV * V
+        if USE_PHASE:
+            p_phase += HV * V
         p_lambda_q += HV
         p_lambda_k += HV
         if USE_G:
@@ -616,6 +666,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor | None = None,
+    phase: torch.Tensor | None = None,
     lambda_q: torch.Tensor | None = None,
     lambda_k: torch.Tensor | None = None,
     scale: float = None,
@@ -625,6 +676,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
+    num_phase_channels: int = 0,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -652,6 +704,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd(
         v=v,
         g=g,
         beta=beta,
+        phase=phase,
         lambda_q=lambda_q,
         lambda_k=lambda_k,
         o=o,
@@ -661,6 +714,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd(
         bt=final_bias_state,
         cu_seqlens=cu_seqlens,
         scale=scale,
+        num_phase_channels=num_phase_channels,
         T=T,
         H=H,
         HV=HV,
@@ -967,6 +1021,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     gk: torch.Tensor | None = None,
     gv: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
+    phase: torch.Tensor | None = None,
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
@@ -974,6 +1029,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
+    num_phase_channels: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -1000,11 +1056,13 @@ def fused_recurrent_gated_delta_rule_fwd(
         gk=gk,
         gv=gv,
         beta=beta,
+        phase=phase,
         o=o,
         h0=initial_state,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         scale=scale,
+        num_phase_channels=num_phase_channels,
         T=T,
         H=H,
         HV=HV,
@@ -1035,6 +1093,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         gk: torch.Tensor | None = None,
         gv: torch.Tensor | None = None,
         beta: torch.Tensor | None = None,
+        phase: torch.Tensor | None = None,
         scale: float = None,
         initial_state: torch.Tensor = None,
         output_final_state: bool = False,
@@ -1042,6 +1101,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         cu_seqlens: torch.LongTensor | None = None,
         use_exp2: bool = False,
         transpose_state_layout: bool = False,
+        num_phase_channels: int = 0,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
@@ -1051,6 +1111,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             gk=gk,
             gv=gv,
             beta=beta,
+            phase=phase,
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
@@ -1058,6 +1119,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
             transpose_state_layout=transpose_state_layout,
+            num_phase_channels=num_phase_channels,
         )
 
         return o, final_state
@@ -1087,6 +1149,8 @@ def fused_recurrent_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -1181,6 +1245,7 @@ def fused_recurrent_gated_delta_rule(
         gk,
         gv,
         beta,
+        phase,
         scale,
         initial_state,
         output_final_state,
@@ -1188,6 +1253,7 @@ def fused_recurrent_gated_delta_rule(
         cu_seqlens,
         use_exp2,
         transpose_state_layout,
+        num_phase_channels,
     )
     return o, final_state
 
@@ -1209,6 +1275,8 @@ def fused_recurrent_gated_delta_rule_rank1_dc(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -1228,6 +1296,10 @@ def fused_recurrent_gated_delta_rule_rank1_dc(
     needs_backward = torch.is_grad_enabled() and any(
         x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k) if x is not None
     )
+    if phase is not None and num_phase_channels > 0 and needs_backward:
+        raise NotImplementedError(
+            "Phase-aware fused_recurrent_gated_delta_rule_rank1_dc does not support backward yet."
+        )
     if needs_backward:
         if cu_seqlens is not None:
             raise NotImplementedError(
@@ -1267,6 +1339,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc(
         v=v,
         beta=beta,
         g=g,
+        phase=phase,
         lambda_q=lambda_q,
         lambda_k=lambda_k,
         scale=scale,
@@ -1276,6 +1349,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc(
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
         transpose_state_layout=transpose_state_layout,
+        num_phase_channels=num_phase_channels,
     )
 
 

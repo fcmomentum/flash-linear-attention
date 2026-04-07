@@ -319,8 +319,12 @@ def chunk_gated_delta_rule(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     cp_context: FLACPContext | None = None,
     transpose_state_layout: bool = False,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
     **kwargs,
 ):
+    if phase is not None and num_phase_channels > 0:
+        raise NotImplementedError("Phase-aware chunk_gated_delta_rule is not implemented yet.")
     r"""
     Args:
         q (torch.Tensor):
@@ -1676,8 +1680,12 @@ def chunk_gated_delta_rule_rank1_dc(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
     **kwargs,
 ):
+    if phase is not None and num_phase_channels > 0:
+        raise NotImplementedError("Phase-aware chunk_gated_delta_rule_rank1_dc is not implemented yet.")
     orig_dtype = v.dtype
     if scale is None:
         scale = k.shape[-1] ** -0.5

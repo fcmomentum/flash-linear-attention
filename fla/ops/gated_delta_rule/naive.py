@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from fla.ops.gated_delta_rule.phase_utils import rotate_phase_channels
+
 
 def _run_recurrent_gated_delta_rule_single_sequence(
     q: torch.Tensor,
@@ -95,23 +97,31 @@ def _run_rank1_dc_single_sequence(
     scale: float,
     h: torch.Tensor,
     b: torch.Tensor,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
 ):
     H, T, K = q.shape
     V = v.shape[-1]
     o = torch.zeros(H, T, V, device=v.device, dtype=torch.float32)
 
     for i in range(T):
+        phase_i = None if phase is None else phase[i]
         b_q = q[:, i]
         b_k = k[:, i]
         b_v = v[:, i]
+        h = rotate_phase_channels(h, phase_i, num_phase_channels=num_phase_channels)
+        b = rotate_phase_channels(b, phase_i, num_phase_channels=num_phase_channels)
         alpha = g[:, i].exp()
         h = h * alpha[:, None, None]
         b = b * alpha[:, None]
+        v_rot = rotate_phase_channels(b_v, phase_i, num_phase_channels=num_phase_channels)
         pred = (h * b_k[..., None]).sum(-2) - lambda_k[:, i, None] * b
-        delta = beta[:, i, None] * (b_v - pred)
+        delta = beta[:, i, None] * (v_rot - pred)
         h = h + b_k.unsqueeze(-1) * delta.unsqueeze(-2)
         b = b + delta
-        o[:, i] = torch.einsum('hk,hkv->hv', b_q * scale, h) - lambda_q[:, i, None] * b
+        h_out = rotate_phase_channels(h, None if phase_i is None else -phase_i, num_phase_channels=num_phase_channels)
+        b_out = rotate_phase_channels(b, None if phase_i is None else -phase_i, num_phase_channels=num_phase_channels)
+        o[:, i] = torch.einsum('hk,hkv->hv', b_q * scale, h_out) - lambda_q[:, i, None] * b_out
     return o, h, b
 
 
@@ -127,6 +137,8 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
     initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    phase: torch.Tensor | None = None,
+    num_phase_channels: int = 0,
 ):
     """
     Reference PyTorch implementation of gated delta rule with rank-1 DC removal.
@@ -157,6 +169,8 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
         lambda x: x.to(torch.float32),
         [q, k, v, beta, g, lambda_q, lambda_k],
     )
+    if phase is not None:
+        phase = phase.to(torch.float32)
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -182,6 +196,7 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
             g_n = g[0, bos:eos].transpose(0, 1).contiguous()
             lambda_q_n = lambda_q[0, bos:eos].transpose(0, 1).contiguous()
             lambda_k_n = lambda_k[0, bos:eos].transpose(0, 1).contiguous()
+            phase_n = None if phase is None else phase[0, bos:eos]
             o_n, h_n, b_n = _run_rank1_dc_single_sequence(
                 q=q_n,
                 k=k_n,
@@ -193,6 +208,8 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
                 scale=scale,
                 h=init_h[n],
                 b=init_b[n],
+                phase=phase_n,
+                num_phase_channels=num_phase_channels,
             )
             o_segments.append(o_n.transpose(0, 1))
             h_segments.append(h_n)
@@ -220,6 +237,7 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
         h_list = []
         b_list = []
         for batch_idx in range(B):
+            phase_b = None if phase is None else phase[batch_idx]
             o_i, h_i, b_i = _run_rank1_dc_single_sequence(
                 q=q[batch_idx],
                 k=k[batch_idx],
@@ -231,6 +249,8 @@ def naive_recurrent_gated_delta_rule_rank1_dc(
                 scale=scale,
                 h=init_h[batch_idx],
                 b=init_b[batch_idx],
+                phase=phase_b,
+                num_phase_channels=num_phase_channels,
             )
             o_list.append(o_i)
             h_list.append(h_i)
