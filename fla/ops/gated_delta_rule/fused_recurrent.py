@@ -1,11 +1,16 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from fla.ops.utils.op import exp, exp2
 from fla.utils import input_guard
+
+
+_USE_TRITON_RANK1_DC_BACKWARD = os.environ.get("FLA_USE_TRITON_RANK1_DC_BWD", "0") == "1"
 
 
 @triton.heuristics({
@@ -320,6 +325,291 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd_kernel(
         tl.store(p_bt, b_b.to(p_bt.dtype.element_ty), mask=mask_v)
 
 
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'USE_INITIAL_BIAS_STATE': lambda args: args['b0'] is not None,
+    'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
+    'USE_FINAL_BIAS_STATE_GRADIENT': lambda args: args['dbt'] is not None,
+})
+@triton.jit(do_not_specialize=['T'])
+def fused_recurrent_gated_delta_rule_rank1_dc_bwd_kernel(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    lambda_q,
+    lambda_k,
+    h_states,
+    b_states,
+    h0,
+    b0,
+    dht,
+    dbt,
+    do,
+    dq,
+    dk,
+    dv,
+    dg,
+    dbeta,
+    dlambda_q,
+    dlambda_k,
+    dh0,
+    db0,
+    cu_seqlens,
+    scale,
+    B,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_G: tl.constexpr,
+    IS_BETA_HEADWISE: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    USE_INITIAL_BIAS_STATE: tl.constexpr,
+    USE_FINAL_STATE_GRADIENT: tl.constexpr,
+    USE_FINAL_BIAS_STATE_GRADIENT: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
+):
+    tl.static_assert(not TRANSPOSE_STATE, "transpose_state backward is not implemented yet")
+    tl.static_assert(not USE_EXP2, "use_exp2 backward is not implemented yet")
+    tl.static_assert(IS_BETA_HEADWISE, "only headwise beta is supported")
+
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_nh // H, i_nh % H
+    all = B * T
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    p_q = q + ((i_b * T + (T - 1)) * H + i_h) * K + o_k
+    p_k = k + ((i_b * T + (T - 1)) * H + i_h) * K + o_k
+    p_v = v + ((i_b * T + (T - 1)) * H + i_h) * V + o_v
+    p_do = do + ((i_b * T + (T - 1)) * H + i_h) * V + o_v
+    p_g = g + (i_b * T + (T - 1)) * H + i_h if USE_G else None
+    p_beta = beta + (i_b * T + (T - 1)) * H + i_h
+    p_lambda_q = lambda_q + (i_b * T + (T - 1)) * H + i_h
+    p_lambda_k = lambda_k + (i_b * T + (T - 1)) * H + i_h
+
+    p_h_prev = h_states + (((i_b * H + i_h) * (T + 1) + (T - 1)) * K * V + o_k[:, None] * V + o_v[None, :])
+    p_h_t = p_h_prev + K * V
+    p_b_prev = b_states + (((i_b * H + i_h) * (T + 1) + (T - 1)) * V + o_v)
+    p_b_t = p_b_prev + V
+
+    p_dq = dq + ((i_v * all + i_b * T + (T - 1)) * H + i_h) * K + o_k
+    p_dk = dk + ((i_v * all + i_b * T + (T - 1)) * H + i_h) * K + o_k
+    p_dv = dv + ((i_b * T + (T - 1)) * H + i_h) * V + o_v
+    p_dg = dg + (i_v * all + i_b * T + (T - 1)) * H + i_h if USE_G else None
+    p_dbeta = dbeta + (i_v * all + i_b * T + (T - 1)) * H + i_h
+    p_dlambda_q = dlambda_q + (i_v * all + i_b * T + (T - 1)) * H + i_h
+    p_dlambda_k = dlambda_k + (i_v * all + i_b * T + (T - 1)) * H + i_h
+
+    b_dh = tl.zeros([BK, BV], dtype=tl.float32)
+    b_db = tl.zeros([BV], dtype=tl.float32)
+    if USE_FINAL_STATE_GRADIENT:
+        p_dht = dht + (i_b * H + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
+        b_dh += tl.load(p_dht, mask=mask_h, other=0).to(tl.float32)
+    if USE_FINAL_BIAS_STATE_GRADIENT:
+        p_dbt = dbt + (i_b * H + i_h) * V + o_v
+        b_db += tl.load(p_dbt, mask=mask_v, other=0).to(tl.float32)
+
+    for _ in tl.range(0, T):
+        b_h_prev = tl.load(p_h_prev, mask=mask_h, other=0).to(tl.float32)
+        b_h_t = tl.load(p_h_t, mask=mask_h, other=0).to(tl.float32)
+        b_b_prev = tl.load(p_b_prev, mask=mask_v, other=0).to(tl.float32)
+        b_b_t = tl.load(p_b_t, mask=mask_v, other=0).to(tl.float32)
+
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        b_do = tl.load(p_do, mask=mask_v, other=0).to(tl.float32)
+        b_beta = tl.load(p_beta).to(tl.float32)
+        b_lambda_q = tl.load(p_lambda_q).to(tl.float32)
+        b_lambda_k = tl.load(p_lambda_k).to(tl.float32)
+        if USE_G:
+            b_alpha = exp(tl.load(p_g).to(tl.float32))
+        else:
+            b_alpha = 1.0
+
+        b_dq = tl.sum(b_h_t * b_do[None, :], axis=1) * scale
+        tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=mask_k)
+
+        b_dh += b_q[:, None] * (b_do * scale)[None, :]
+        b_dlambda_q = -tl.sum(b_b_t * b_do)
+        b_db = b_db - b_lambda_q * b_do
+
+        b_h1 = b_alpha * b_h_prev
+        b_b1 = b_alpha * b_b_prev
+        b_pred = tl.sum(b_h1 * b_k[:, None], axis=0) - b_lambda_k * b_b1
+        b_innovation = b_v - b_pred
+
+        b_dk = tl.sum(b_dh * (b_beta * b_innovation)[None, :], axis=1)
+        b_ddelta = tl.sum(b_dh * b_k[:, None], axis=0) + b_db
+        b_dbeta = tl.sum(b_ddelta * b_innovation)
+        b_dv = b_beta * b_ddelta
+        b_dpred = -b_beta * b_ddelta
+
+        b_dh1 = b_dh + b_k[:, None] * b_dpred[None, :]
+        b_dk += tl.sum(b_h1 * b_dpred[None, :], axis=1)
+        b_dlambda_k = -tl.sum(b_b1 * b_dpred)
+        b_db1 = b_db - b_lambda_k * b_dpred
+
+        b_dalpha = tl.sum(b_dh1 * b_h_prev) + tl.sum(b_db1 * b_b_prev)
+        b_dh = b_alpha * b_dh1
+        b_db = b_alpha * b_db1
+        b_dg_val = b_dalpha * b_alpha if USE_G else 0.0
+
+        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=mask_k)
+        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=mask_v)
+        if USE_G:
+            tl.store(p_dg, b_dg_val.to(p_dg.dtype.element_ty))
+        tl.store(p_dbeta, b_dbeta.to(p_dbeta.dtype.element_ty))
+        tl.store(p_dlambda_q, b_dlambda_q.to(p_dlambda_q.dtype.element_ty))
+        tl.store(p_dlambda_k, b_dlambda_k.to(p_dlambda_k.dtype.element_ty))
+
+        p_q -= H * K
+        p_k -= H * K
+        p_v -= H * V
+        p_do -= H * V
+        if USE_G:
+            p_g -= H
+        p_beta -= H
+        p_lambda_q -= H
+        p_lambda_k -= H
+        p_h_prev -= K * V
+        p_h_t -= K * V
+        p_b_prev -= V
+        p_b_t -= V
+        p_dq -= H * K
+        p_dk -= H * K
+        p_dv -= H * V
+        if USE_G:
+            p_dg -= H
+        p_dbeta -= H
+        p_dlambda_q -= H
+        p_dlambda_k -= H
+
+    if USE_INITIAL_STATE:
+        p_dh0 = dh0 + (i_b * H + i_h) * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_dh0, b_dh.to(p_dh0.dtype.element_ty), mask=mask_h)
+    if USE_INITIAL_BIAS_STATE:
+        p_db0 = db0 + (i_b * H + i_h) * V + o_v
+        tl.store(p_db0, b_db.to(p_db0.dtype.element_ty), mask=mask_v)
+
+
+def fused_recurrent_gated_delta_rule_rank1_dc_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    do: torch.Tensor,
+    dht: torch.Tensor | None,
+    dbt: torch.Tensor | None,
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    h_states: torch.Tensor | None = None,
+    b_states: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    use_exp2: bool = False,
+    transpose_state_layout: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if cu_seqlens is not None:
+        raise NotImplementedError("Triton backward for fused recurrent rank-1 DC does not support `cu_seqlens` yet.")
+    if transpose_state_layout:
+        raise NotImplementedError("Triton backward for fused recurrent rank-1 DC does not support transposed layout.")
+    if use_exp2:
+        raise NotImplementedError("Triton backward for fused recurrent rank-1 DC does not support use_exp2.")
+    if q.shape[2] != v.shape[2]:
+        raise NotImplementedError("Triton backward for fused recurrent rank-1 DC requires q and v to have the same head count.")
+    if beta.ndim == v.ndim:
+        raise NotImplementedError("Triton backward for fused recurrent rank-1 DC only supports headwise beta.")
+    if h_states is None or b_states is None:
+        raise ValueError("h_states and b_states must be provided for Triton backward.")
+
+    B, T, H, K, V = *q.shape, v.shape[-1]
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 32)
+    NV = triton.cdiv(V, BV)
+
+    dq = q.new_empty(NV, *q.shape)
+    dk = q.new_empty(NV, *k.shape)
+    dv = q.new_empty(*v.shape)
+    dg = q.new_empty(NV, *g.shape) if g is not None else None
+    dbeta = q.new_empty(NV, *beta.shape)
+    dlambda_q = q.new_empty(NV, *lambda_q.shape)
+    dlambda_k = q.new_empty(NV, *lambda_k.shape)
+
+    if initial_state is not None and initial_state[0].requires_grad:
+        dh0 = q.new_empty(B, H, K, V, dtype=torch.float32)
+        db0 = q.new_empty(B, H, V, dtype=torch.float32)
+    else:
+        dh0 = None
+        db0 = None
+
+    grid = (NV, B * H)
+    fused_recurrent_gated_delta_rule_rank1_dc_bwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        lambda_q=lambda_q,
+        lambda_k=lambda_k,
+        h_states=h_states,
+        b_states=b_states,
+        h0=initial_state[0] if initial_state is not None else None,
+        b0=initial_state[1] if initial_state is not None else None,
+        dht=dht,
+        dbt=dbt,
+        do=do,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        dg=dg,
+        dbeta=dbeta,
+        dlambda_q=dlambda_q,
+        dlambda_k=dlambda_k,
+        dh0=dh0,
+        db0=db0,
+        cu_seqlens=None,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HV=H,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        IS_BETA_HEADWISE=True,
+        USE_EXP2=False,
+        TRANSPOSE_STATE=False,
+        num_warps=2,
+        num_stages=1,
+    )
+
+    dq = dq.sum(0)
+    dk = dk.sum(0)
+    dbeta = dbeta.sum(0)
+    dlambda_q = dlambda_q.sum(0)
+    dlambda_k = dlambda_k.sum(0)
+    if dg is not None:
+        dg = dg.sum(0)
+
+    return dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dh0, db0
+
+
 def fused_recurrent_gated_delta_rule_rank1_dc_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -564,6 +854,7 @@ class FusedRecurrentRank1DCFunction(torch.autograd.Function):
         ctx.scale = scale
         ctx.has_initial_state = has_initial_state
         ctx.output_final_state = output_final_state
+        ctx.use_triton_backward = _USE_TRITON_RANK1_DC_BACKWARD
         ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0)
         with torch.no_grad():
             o, final_state, _, _ = _dense_rank1_dc_forward_batched(
@@ -592,8 +883,38 @@ class FusedRecurrentRank1DCFunction(torch.autograd.Function):
             dstate = None
         if dbias_state is not None and dbias_state.numel() == 0:
             dbias_state = None
-        with torch.no_grad():
-            _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+        if ctx.use_triton_backward:
+            dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = fused_recurrent_gated_delta_rule_rank1_dc_bwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
+                do=do,
+                dht=dstate,
+                dbt=dbias_state,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                cu_seqlens=None,
+                use_exp2=False,
+                transpose_state_layout=False,
+            )
+        else:
+            with torch.no_grad():
+                _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    lambda_q=lambda_q,
+                    lambda_k=lambda_k,
+                    scale=ctx.scale,
+                    initial_state=initial_state,
+                )
+            dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
                 q=q,
                 k=k,
                 v=v,
@@ -602,23 +923,12 @@ class FusedRecurrentRank1DCFunction(torch.autograd.Function):
                 lambda_q=lambda_q,
                 lambda_k=lambda_k,
                 scale=ctx.scale,
-                initial_state=initial_state,
+                h_states=h_states,
+                b_states=b_states,
+                do=do,
+                dstate=dstate,
+                dbias_state=dbias_state,
             )
-        dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            lambda_q=lambda_q,
-            lambda_k=lambda_k,
-            scale=ctx.scale,
-            h_states=h_states,
-            b_states=b_states,
-            do=do,
-            dstate=dstate,
-            dbias_state=dbias_state,
-        )
         if not ctx.has_initial_state:
             dstate0 = None
             dbias0 = None
