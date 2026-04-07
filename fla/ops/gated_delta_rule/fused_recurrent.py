@@ -550,7 +550,7 @@ def fused_recurrent_gated_delta_rule_rank1_dc_bwd(
     dlambda_q = q.new_empty(NV, *lambda_q.shape)
     dlambda_k = q.new_empty(NV, *lambda_k.shape)
 
-    if initial_state is not None and initial_state[0].requires_grad:
+    if initial_state is not None:
         dh0 = q.new_empty(B, H, K, V, dtype=torch.float32)
         db0 = q.new_empty(B, H, V, dtype=torch.float32)
     else:
