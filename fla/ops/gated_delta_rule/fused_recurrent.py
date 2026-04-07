@@ -390,6 +390,258 @@ def fused_recurrent_gated_delta_rule_rank1_dc_fwd(
     return o, (final_state, final_bias_state)
 
 
+def _dense_rank1_dc_forward_batched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None,
+):
+    qh, kh, vh, gh, betah, lqh, lkh = (
+        q.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        k.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        v.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        g.permute(0, 2, 1).contiguous().to(torch.float32),
+        beta.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_q.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_k.permute(0, 2, 1).contiguous().to(torch.float32),
+    )
+    batch_size, num_heads, seq_len, k_dim = qh.shape
+    v_dim = vh.shape[-1]
+    if initial_state is None:
+        h = vh.new_zeros(batch_size, num_heads, k_dim, v_dim)
+        b = vh.new_zeros(batch_size, num_heads, v_dim)
+    else:
+        h = initial_state[0].to(torch.float32)
+        b = initial_state[1].to(torch.float32)
+
+    outputs = []
+    h_states = [h]
+    b_states = [b]
+    for t in range(seq_len):
+        alpha_t = gh[:, :, t].exp()
+        h1 = h * alpha_t[..., None, None]
+        b1 = b * alpha_t[..., None]
+        pred = torch.einsum('bhkv,bhk->bhv', h1, kh[:, :, t]) - lkh[:, :, t][..., None] * b1
+        delta = betah[:, :, t][..., None] * (vh[:, :, t] - pred)
+        h = h1 + torch.einsum('bhk,bhv->bhkv', kh[:, :, t], delta)
+        b = b1 + delta
+        outputs.append(scale * torch.einsum('bhk,bhkv->bhv', qh[:, :, t], h) - lqh[:, :, t][..., None] * b)
+        h_states.append(h)
+        b_states.append(b)
+    o = torch.stack(outputs, dim=2).permute(0, 2, 1, 3).contiguous()
+    return o, (h, b), torch.stack(h_states, dim=2), torch.stack(b_states, dim=2)
+
+
+def _dense_rank1_dc_backward_batched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    lambda_q: torch.Tensor,
+    lambda_k: torch.Tensor,
+    scale: float,
+    h_states: torch.Tensor,
+    b_states: torch.Tensor,
+    do: torch.Tensor,
+    dstate: torch.Tensor | None,
+    dbias_state: torch.Tensor | None,
+):
+    qh, kh, vh, gh, betah, lqh, lkh, doh = (
+        q.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        k.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        v.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+        g.permute(0, 2, 1).contiguous().to(torch.float32),
+        beta.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_q.permute(0, 2, 1).contiguous().to(torch.float32),
+        lambda_k.permute(0, 2, 1).contiguous().to(torch.float32),
+        do.permute(0, 2, 1, 3).contiguous().to(torch.float32),
+    )
+    batch_size, num_heads, seq_len, k_dim = qh.shape
+    v_dim = vh.shape[-1]
+    dh = h_states.new_zeros(batch_size, num_heads, k_dim, v_dim) if dstate is None else dstate.to(torch.float32)
+    db = b_states.new_zeros(batch_size, num_heads, v_dim) if dbias_state is None else dbias_state.to(torch.float32)
+
+    dq = torch.zeros_like(qh)
+    dk = torch.zeros_like(kh)
+    dv = torch.zeros_like(vh)
+    dg = torch.zeros_like(gh)
+    dbeta = torch.zeros_like(betah)
+    dlambda_q = torch.zeros_like(lqh)
+    dlambda_k = torch.zeros_like(lkh)
+
+    for t in range(seq_len - 1, -1, -1):
+        h_prev = h_states[:, :, t]
+        h_t = h_states[:, :, t + 1]
+        b_prev = b_states[:, :, t]
+        b_t = b_states[:, :, t + 1]
+
+        q_t = qh[:, :, t]
+        k_t = kh[:, :, t]
+        v_t = vh[:, :, t]
+        do_t = doh[:, :, t]
+        alpha_t = gh[:, :, t].exp()
+        beta_t = betah[:, :, t]
+        lambda_q_t = lqh[:, :, t]
+        lambda_k_t = lkh[:, :, t]
+
+        dq[:, :, t] = scale * torch.einsum('bhv,bhkv->bhk', do_t, h_t)
+        dh = dh + scale * torch.einsum('bhk,bhv->bhkv', q_t, do_t)
+        dlambda_q[:, :, t] = -(b_t * do_t).sum(-1)
+        db = db - lambda_q_t[..., None] * do_t
+
+        h1 = alpha_t[..., None, None] * h_prev
+        b1 = alpha_t[..., None] * b_prev
+        pred = torch.einsum('bhkv,bhk->bhv', h1, k_t) - lambda_k_t[..., None] * b1
+        innovation = v_t - pred
+
+        dk[:, :, t] = torch.einsum('bhkv,bhv->bhk', dh, beta_t[..., None] * innovation)
+        ddelta = torch.einsum('bhkv,bhk->bhv', dh, k_t) + db
+        dbeta[:, :, t] = (ddelta * innovation).sum(-1)
+        dv[:, :, t] = beta_t[..., None] * ddelta
+        dpred = -beta_t[..., None] * ddelta
+
+        dh1 = dh + torch.einsum('bhk,bhv->bhkv', k_t, dpred)
+        dk[:, :, t] = dk[:, :, t] + torch.einsum('bhkv,bhv->bhk', h1, dpred)
+        dlambda_k[:, :, t] = -(b1 * dpred).sum(-1)
+        db1 = db - lambda_k_t[..., None] * dpred
+
+        dalpha = (dh1 * h_prev).sum(dim=(-1, -2)) + (db1 * b_prev).sum(dim=-1)
+        dh = alpha_t[..., None, None] * dh1
+        db = alpha_t[..., None] * db1
+        dg[:, :, t] = dalpha * alpha_t
+
+    return (
+        dq.permute(0, 2, 1, 3).contiguous(),
+        dk.permute(0, 2, 1, 3).contiguous(),
+        dv.permute(0, 2, 1, 3).contiguous(),
+        dg.permute(0, 2, 1).contiguous(),
+        dbeta.permute(0, 2, 1).contiguous(),
+        dlambda_q.permute(0, 2, 1).contiguous(),
+        dlambda_k.permute(0, 2, 1).contiguous(),
+        dh,
+        db,
+    )
+
+
+class FusedRecurrentRank1DCFunction(torch.autograd.Function):
+
+    @staticmethod
+    @input_guard
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor | None,
+        beta: torch.Tensor,
+        lambda_q: torch.Tensor,
+        lambda_k: torch.Tensor,
+        scale: float,
+        state0: torch.Tensor,
+        bias_state0: torch.Tensor,
+        has_initial_state: bool,
+        output_final_state: bool,
+        use_qk_l2norm_in_kernel: bool,
+        cu_seqlens: torch.LongTensor | None,
+        use_exp2: bool,
+        transpose_state_layout: bool,
+    ):
+        if cu_seqlens is not None:
+            raise NotImplementedError("Backward-capable fused rank-1 DC currently supports dense inputs only.")
+        if use_qk_l2norm_in_kernel:
+            raise NotImplementedError("Backward-capable fused rank-1 DC does not support q/k l2 norm in kernel.")
+        if use_exp2:
+            raise NotImplementedError("Backward-capable fused rank-1 DC does not support use_exp2 yet.")
+        if transpose_state_layout:
+            raise NotImplementedError("Backward-capable fused rank-1 DC does not support transposed state layout yet.")
+        initial_state = (state0, bias_state0) if has_initial_state else None
+        ctx.scale = scale
+        ctx.has_initial_state = has_initial_state
+        ctx.output_final_state = output_final_state
+        ctx.save_for_backward(q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0)
+        with torch.no_grad():
+            o, final_state, _, _ = _dense_rank1_dc_forward_batched(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
+                scale=scale,
+                initial_state=initial_state,
+            )
+        state, bias_state = final_state
+        if not output_final_state:
+            empty = q.new_zeros(0, dtype=torch.float32)
+            return o, empty, empty
+        return o, state, bias_state
+
+    @staticmethod
+    @input_guard
+    def backward(ctx, do, dstate, dbias_state):
+        q, k, v, g, beta, lambda_q, lambda_k, state0, bias_state0 = ctx.saved_tensors
+        initial_state = (state0, bias_state0) if ctx.has_initial_state else None
+        if dstate is not None and dstate.numel() == 0:
+            dstate = None
+        if dbias_state is not None and dbias_state.numel() == 0:
+            dbias_state = None
+        with torch.no_grad():
+            _, _, h_states, b_states = _dense_rank1_dc_forward_batched(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                lambda_q=lambda_q,
+                lambda_k=lambda_k,
+                scale=ctx.scale,
+                initial_state=initial_state,
+            )
+        dq, dk, dv, dg, dbeta, dlambda_q, dlambda_k, dstate0, dbias0 = _dense_rank1_dc_backward_batched(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            lambda_q=lambda_q,
+            lambda_k=lambda_k,
+            scale=ctx.scale,
+            h_states=h_states,
+            b_states=b_states,
+            do=do,
+            dstate=dstate,
+            dbias_state=dbias_state,
+        )
+        if not ctx.has_initial_state:
+            dstate0 = None
+            dbias0 = None
+        return (
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+            dg.to(g.dtype) if g is not None else None,
+            dbeta.to(beta.dtype),
+            dlambda_q.to(lambda_q.dtype),
+            dlambda_k.to(lambda_k.dtype),
+            None,
+            dstate0,
+            dbias0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def fused_recurrent_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -641,11 +893,6 @@ def fused_recurrent_gated_delta_rule_rank1_dc(
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v, lambda_q, lambda_k) if x is not None):
-        raise NotImplementedError(
-            "Backward pass is not implemented for fused_recurrent_gated_delta_rule_rank1_dc. "
-            "Use the reference path for experiments that require gradients."
-        )
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -661,6 +908,42 @@ def fused_recurrent_gated_delta_rule_rank1_dc(
         scale = k.shape[-1] ** -0.5
     if beta is None:
         beta = torch.ones_like(q[..., 0])
+    needs_backward = torch.is_grad_enabled() and any(
+        x.requires_grad for x in (q, k, v, g, beta, lambda_q, lambda_k) if x is not None
+    )
+    if needs_backward:
+        if cu_seqlens is not None:
+            raise NotImplementedError(
+                "Backward-capable fused_recurrent_gated_delta_rule_rank1_dc does not support `cu_seqlens` yet."
+            )
+        if initial_state is None:
+            state0 = q.new_zeros(0, dtype=torch.float32)
+            bias_state0 = q.new_zeros(0, dtype=torch.float32)
+            has_initial_state = False
+        else:
+            state0, bias_state0 = initial_state
+            has_initial_state = True
+        o, state, bias_state = FusedRecurrentRank1DCFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            lambda_q,
+            lambda_k,
+            scale,
+            state0,
+            bias_state0,
+            has_initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            cu_seqlens,
+            use_exp2,
+            transpose_state_layout,
+        )
+        if not output_final_state:
+            return o, None
+        return o, (state, bias_state)
     return fused_recurrent_gated_delta_rule_rank1_dc_fwd(
         q=q,
         k=k,
