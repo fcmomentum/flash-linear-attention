@@ -12,8 +12,9 @@ from einops import rearrange, repeat
 from torch.nn import functional as F
 
 from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, update_layer_cache
-from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
+from fla.modules import FusedRMSNormGated, RMSNorm, RotaryEmbedding, ShortConvolution
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -98,6 +99,10 @@ class GatedDeltaNet(nn.Module):
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
+        rope_theta: float = 10000.,
+        qk_rope_head_dim: int | None = None,
+        qk_activation_on_non_phase_only: bool = False,
+        max_position_embeddings: int | None = None,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         **kwargs,
@@ -122,6 +127,11 @@ class GatedDeltaNet(nn.Module):
         self.head_v_dim = int(self.head_dim * self.expand_v)
         self.key_dim = int(self.num_heads * self.head_k_dim)
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
+        self.rope_theta = rope_theta
+        self.qk_rope_head_dim = self.head_k_dim if qk_rope_head_dim is None else qk_rope_head_dim
+        self.qk_nope_head_dim = self.head_k_dim - self.qk_rope_head_dim
+        self.qk_activation_on_non_phase_only = qk_activation_on_non_phase_only
+        self.max_position_embeddings = max_position_embeddings
         self.layer_idx = layer_idx
 
         # Consistency check: Ensure expand_v produces integer values
@@ -140,6 +150,12 @@ class GatedDeltaNet(nn.Module):
                 f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
                 f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
             )
+        if not 0 <= self.qk_rope_head_dim <= self.head_k_dim:
+            raise ValueError(
+                f"qk_rope_head_dim={self.qk_rope_head_dim} must be in [0, {self.head_k_dim}].",
+            )
+        if self.qk_rope_head_dim % 2 != 0:
+            raise ValueError(f"qk_rope_head_dim={self.qk_rope_head_dim} must be even.")
         assert mode in ['chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
@@ -173,13 +189,13 @@ class GatedDeltaNet(nn.Module):
                 hidden_size=self.key_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu',
+                activation=None if self.qk_activation_on_non_phase_only else 'silu',
             )
             self.k_conv1d = ShortConvolution(
                 hidden_size=self.key_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu',
+                activation=None if self.qk_activation_on_non_phase_only else 'silu',
             )
             self.v_conv1d = ShortConvolution(
                 hidden_size=self.value_dim,
@@ -198,6 +214,20 @@ class GatedDeltaNet(nn.Module):
         else:
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        if self.qk_rope_head_dim > 0:
+            self.rotary = RotaryEmbedding(dim=self.qk_rope_head_dim, base=self.rope_theta)
+
+    def _apply_qk_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.qk_activation_on_non_phase_only:
+            return F.silu(x)
+        if self.qk_rope_head_dim == 0:
+            return F.silu(x)
+        if self.qk_nope_head_dim == 0:
+            return x
+        x = rearrange(x, '... (h d) -> ... h d', h=self.num_heads, d=self.head_k_dim)
+        x_pass, x_phase = torch.split(x, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        x = torch.cat((F.silu(x_pass), x_phase), dim=-1)
+        return rearrange(x, '... h d -> ... (h d)')
 
     def forward(
         self,
@@ -251,15 +281,44 @@ class GatedDeltaNet(nn.Module):
                 cu_seqlens=cu_seqlens,
             )
         else:
-            q = F.silu(self.q_proj(hidden_states))
-            k = F.silu(self.k_proj(hidden_states))
+            q = self._apply_qk_activation(self.q_proj(hidden_states))
+            k = self._apply_qk_activation(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
+
+        if self.use_short_conv and self.qk_activation_on_non_phase_only:
+            q = self._apply_qk_activation(q)
+            k = self._apply_qk_activation(k)
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
         if self.num_v_heads > self.num_heads:
             q, k = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads), (q, k))
+
+        seqlen_offset, max_seqlen = 0, q_len
+        if past_key_values is not None:
+            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+            max_seqlen = q_len + seqlen_offset
+
+            if attention_mask is not None:
+                seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
+                max_seqlen = q_len + max(seqlen_offset)
+
+        if self.max_position_embeddings is not None:
+            max_seqlen = max(max_seqlen, self.max_position_embeddings)
+
+        if self.qk_rope_head_dim > 0:
+            q_pass, q_rot = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            k_pass, k_rot = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            q_rot, k_rot = self.rotary(
+                q_rot,
+                k_rot,
+                seqlen_offset=seqlen_offset,
+                max_seqlen=max_seqlen,
+                cu_seqlens=cu_seqlens,
+            )
+            q = torch.cat((q_pass, q_rot), dim=-1)
+            k = torch.cat((k_pass, k_rot), dim=-1)
 
         beta = self.b_proj(hidden_states).sigmoid()
         if self.allow_neg_eigval:

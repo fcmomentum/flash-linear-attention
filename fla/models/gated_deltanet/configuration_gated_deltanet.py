@@ -18,6 +18,8 @@ class GatedDeltaNetConfig(PretrainedConfig):
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
         head_dim: int = 256,
+        qk_rope_head_dim: int | None = None,
+        qk_activation_on_non_phase_only: bool = False,
         num_heads: int = 6,
         num_v_heads: int | None = None,
         max_position_embeddings: int = 2048,
@@ -48,6 +50,8 @@ class GatedDeltaNetConfig(PretrainedConfig):
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.head_dim = head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_activation_on_non_phase_only = qk_activation_on_non_phase_only
         self.num_heads = num_heads
         self.num_v_heads = num_v_heads
         self.max_position_embeddings = max_position_embeddings
